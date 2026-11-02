@@ -61,7 +61,8 @@ pub fn parse(source: &[u8]) -> Result<Program, Error> {
 
 /// `parse`, on a thread whose stack is `stack_size` bytes (0: unknown, so
 /// assume 2 MiB, the smallest stack a thread usually has: Rust gives the
-/// threads it spawns 2 MiB, and the main thread usually has 8 MiB).  The
+/// threads it spawns 2 MiB, and the main thread usually has 8 MiB; on a
+/// thread with less stack left than that, pass the real size).  The
 /// parser uses at most half of it, leaving the rest for the interpreter's
 /// own recursion over the deepest expressions.
 pub fn parse_with_stack(source: &[u8], stack_size: usize) -> Result<Program, Error> {
@@ -187,6 +188,8 @@ struct Parser {
     calls: Vec<(String, usize, u32)>,
     /// How deeply the recursive parsing functions are nested (see `nested`).
     depth: usize,
+    /// How many of those levels are chain links ([`Parser::link`]).
+    links: usize,
     /// Where the stack was when parsing began, and how much of it the
     /// parser may use (see `nested`).
     stack_base: usize,
@@ -206,6 +209,14 @@ struct Parser {
 /// interpreter's recursion over it, within reason.
 const MAX_NESTING: usize = 20_100;
 
+/// Stack set aside per chain link ([`Parser::link`]).  A link costs the
+/// parser nothing, but running or freeing the tree later recurses once per
+/// link; that takes about 100 bytes a level when freeing, more in the
+/// interpreter, and more again in a debug build.  So on a 2 MiB thread
+/// (a 1 MiB budget) chains are limited to 2,048 links, while hawk's own
+/// 1 GiB thread allows the full `MAX_NESTING`.
+const LINK_COST: usize = 512;
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Parser {
         Parser {
@@ -217,6 +228,7 @@ impl Parser {
             var_uses: Vec::new(),
             calls: Vec::new(),
             depth: 0,
+            links: 0,
             stack_base: stack_position(),
             stack_budget: 0,
             print_group_at: None,
@@ -235,15 +247,15 @@ impl Parser {
         // `wrapping_sub` because the subtraction must not panic even if
         // the stack were laid out unexpectedly; the check then just fails.
         let used = self.stack_base.wrapping_sub(stack_position());
-        if self.depth >= MAX_NESTING || used > self.stack_budget {
+        if self.too_deep(used) {
             return Err(self.error("nesting too deep"));
         }
         // Restore the depth rather than subtracting one: any chain links
         // ([`Parser::link`]) made at this level are given back too.
-        let depth = self.depth;
+        let (depth, links) = (self.depth, self.links);
         self.depth += 1;
         let result = parse(self);
-        self.depth = depth;
+        (self.depth, self.links) = (depth, links);
         result
     }
 
@@ -254,11 +266,20 @@ impl Parser {
     /// link counts towards the nesting limit until the enclosing
     /// [`Parser::nested`] call returns.
     fn link(&mut self) -> Result<(), Error> {
-        if self.depth >= MAX_NESTING {
+        let used = self.stack_base.wrapping_sub(stack_position());
+        if self.too_deep(used) {
             return Err(self.error("nesting too deep"));
         }
         self.depth += 1;
+        self.links += 1;
         Ok(())
+    }
+
+    /// Is one more level too many, given `used` bytes of stack so far?
+    /// The stack the chain links will need later counts as used.
+    fn too_deep(&self, used: usize) -> bool {
+        let reserved = self.links.saturating_mul(LINK_COST);
+        self.depth >= MAX_NESTING || used.saturating_add(reserved) > self.stack_budget
     }
 
     // ------------------------------------------------------------ utilities
@@ -2062,6 +2083,40 @@ mod tests {
     }
 
     #[test]
+    fn chains_fit_the_stack_of_a_default_thread() {
+        // On a 2 MiB thread, whatever `parse` accepts must be safe to free
+        // (which recurses over the tree's depth), and to run: running it may
+        // fail, as the interpreter needs more stack per level, but with an
+        // error, not a crash.  Longer chains must be a syntax error.
+        let run = || {
+            let mut cases = vec![];
+            for n in [100, 1000, 3000, 10_000, 1_000_000] {
+                for op in ["+1", " 1", "&&1", "~1", " in a"] {
+                    cases.push((n, format!("BEGIN {{ x = 1{} }}", op.repeat(n))));
+                }
+                let (open, close) = ("(1+".repeat(n), ")".repeat(n));
+                cases.push((n, format!("BEGIN {{ x = {open}1{close} }}")));
+            }
+            for (n, src) in cases {
+                let head: String = src.chars().take(20).collect();
+                match parse(src.as_bytes()) {
+                    Ok(prog) => {
+                        assert!(n <= 10_000, "{head} x {n} accepted");
+                        let config = crate::interp::Config::default();
+                        let mut interp = crate::interp::Interp::new(&prog, &config).unwrap();
+                        if let Err(e) = interp.run() {
+                            let e = e.to_string();
+                            assert!(e.contains("expression nesting too deep"), "{e}");
+                        }
+                    }
+                    Err(e) => assert!(e.to_string().contains("nesting too deep"), "{e}"),
+                }
+            }
+        };
+        std::thread::spawn(run).join().unwrap();
+    }
+
+    #[test]
     fn long_operator_chains_are_an_error_not_a_crash() {
         // `1+1+1+...` is parsed by a loop, not recursion, but still builds
         // a tree as deep as the chain is long, and the interpreter (and
@@ -2085,13 +2140,20 @@ mod tests {
             let msg = parse_on_small_stack(src).unwrap_or_default();
             assert!(msg.starts_with(too_deep), "{head}: {msg}");
         }
-        // Long but sane chains are fine (pyawk fails before 1,000 terms).
+        // Long but sane chains are fine given hawk's big stack (pyawk fails
+        // before 1,000 terms).
         let src = format!(
             "BEGIN {{ x = 1{}; y = 1{} }}",
             "+1".repeat(10_000),
             " 1".repeat(10_000)
         );
-        assert_eq!(parse_on_small_stack(src), None);
+        let parsed = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || parse_with_stack(src.as_bytes(), 1 << 30).err())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(parsed, None);
     }
 
     #[test]

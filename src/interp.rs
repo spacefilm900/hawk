@@ -192,6 +192,11 @@ pub struct Interp<'p> {
     /// interpreter may use below it.
     stack_base: usize,
     stack_budget: usize,
+    /// How much stack the interpreter's own recursion over the program
+    /// (expressions, conditions, statements) may use: halfway between the
+    /// function-call budget and the end of the stack, so runaway recursion
+    /// is still reported as such, and there is room left to report it.
+    eval_limit: usize,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -211,6 +216,35 @@ fn bytes_to_string(b: &[u8]) -> String {
 }
 
 impl<'p> Interp<'p> {
+    /// The stack size from `config`.  0 means unknown: assume 2 MiB, what
+    /// Rust gives the threads it spawns (see `Config::stack_size`).
+    fn stack_size(config: &Config) -> usize {
+        match config.stack_size {
+            0 => 2 << 20,
+            n => n,
+        }
+    }
+
+    /// How much stack user function calls may use.  On a small stack
+    /// (under 8 MiB) the margin would eat it all, so the budget is then
+    /// half the stack instead.
+    fn stack_budget(config: &Config) -> usize {
+        let stack_size = Self::stack_size(config);
+        stack_size.saturating_sub(STACK_MARGIN).max(stack_size / 2)
+    }
+
+    /// Stop with an error, not a crash, when evaluating a very deep
+    /// expression (or statement) would run out of stack.  The parser
+    /// bounds how deep the program's tree is, but cannot know the stack
+    /// the interpreter will be given, nor how much each level takes
+    /// (about 1 KiB in a release build, several in a debug build).
+    fn check_stack(&self) -> R<()> {
+        if self.stack_base.saturating_sub(stack_position()) > self.eval_limit {
+            return rt("expression nesting too deep");
+        }
+        Ok(())
+    }
+
     pub fn new(prog: &'p Program, config: &Config) -> R<Interp<'p>> {
         let mut it = Interp {
             prog,
@@ -234,12 +268,13 @@ impl<'p> Interp<'p> {
             stack_base: stack_position(),
             // 0: the stack size is unknown, so assume 2 MiB, what Rust
             // gives the threads it spawns (see `Config::stack_size`).
-            stack_budget: match config.stack_size {
-                0 => 2 << 20,
-                n => n,
-            }
-            .saturating_sub(STACK_MARGIN)
-            .max(STACK_MARGIN / 4),
+            // On a small stack (under 8 MiB) the margin would eat it all, so
+            // the budget is then half the stack instead.
+            stack_budget: Self::stack_budget(config),
+            eval_limit: {
+                let budget = Self::stack_budget(config);
+                budget + (Self::stack_size(config) - budget) / 2
+            },
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
@@ -913,6 +948,7 @@ impl<'p> Interp<'p> {
     }
 
     fn exec(&mut self, s: &'p Stmt) -> R<Flow> {
+        self.check_stack()?;
         match s {
             Stmt::Block(b) => return self.exec_block(b),
             Stmt::Expr(e) => {
@@ -1068,6 +1104,7 @@ impl<'p> Interp<'p> {
 
     /// An expression as a truth value.
     fn cond(&mut self, e: &'p Expr) -> R<bool> {
+        self.check_stack()?;
         Ok(match e {
             // A bare /re/ as a condition means `$0 ~ /re/`.
             Expr::Regex(src) => {
@@ -1117,6 +1154,7 @@ impl<'p> Interp<'p> {
     }
 
     pub fn eval(&mut self, e: &'p Expr) -> R<Value> {
+        self.check_stack()?;
         Ok(match e {
             Expr::Num(n) => Value::Num(*n),
             Expr::Str(s) => Value::str(s),
@@ -1651,6 +1689,29 @@ mod tests {
         .join()
         .unwrap()
         .unwrap_or_default();
+        assert!(msg.contains("function call nesting too deep"), "{msg}");
+    }
+
+    #[test]
+    fn runaway_recursion_is_safe_on_a_small_stack() {
+        // A caller that says its stack is only 1 MiB must still get the
+        // error, not a crash: the budget is then half the stack.
+        let src = b"function f(n) { return f(n + 1) } BEGIN { f(0) }";
+        let msg = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let prog = crate::parser::parse_with_stack(src, 1 << 20).unwrap();
+                let config = Config {
+                    stack_size: 1 << 20,
+                    ..Config::default()
+                };
+                let mut interp = Interp::new(&prog, &config).unwrap();
+                interp.run().err().map(|e| e.to_string())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_or_default();
         assert!(msg.contains("function call nesting too deep"), "{msg}");
     }
 

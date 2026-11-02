@@ -150,7 +150,16 @@ resolved to slots or cached at load time without changing the interface.
   stack position with the start of the run and stops with pyawk's
   "function call nesting too deep (runaway recursion?)" before the stack
   runs out (about 300 000 levels in a release build with 1 GiB), instead
-  of crashing.
+  of crashing. On a stack under 8 MiB the function-call budget is half
+  the stack (the usual 4 MiB margin would leave nothing).
+  Evaluating an expression, a condition or a statement also checks the
+  stack (one comparison; no measurable cost in `tools/bench.py`), at a
+  limit halfway between that budget and the end of the stack, and stops
+  with "expression nesting too deep". Each tree level costs the
+  interpreter about 1 KiB in a release build and several in a debug
+  build, more than parsing it did, so the parser's limits alone cannot
+  keep a small stack safe. On hawk's own 1 GiB stack this never fires for
+  a program the parser accepts.
 * **Nesting in the program text.** The parser recurses too. Every
   recursive parsing function counts its depth and checks the stack it has
   used (at most half the thread's stack); past 20,100 levels (5,000
@@ -159,14 +168,19 @@ resolved to slots or cached at load time without changing the interface.
   Operator chains such as `1+1+...+1` are parsed by loops, but build a
   tree as deep as the chain is long, which the interpreter (and freeing
   the tree) recurse over; so each link counts as a level too, until the
-  enclosing expression ends. A chain of 4 million terms used to overflow
-  the 1 GiB stack; now chains past about 20,000 terms are a syntax error.
+  enclosing expression ends, and reserves 512 bytes of the parser's
+  stack budget for freeing and running the tree later. A chain of 4
+  million terms used to overflow the 1 GiB stack; now chains past about
+  20,000 terms are a syntax error (about 2,000 on a 2 MiB stack).
 * **Unknown stack size.** `cli.rs` tells the parser and the interpreter
   how big their stack is. Library callers of `parser::parse` (or an
   interpreter `Config` with `stack_size` 0) do not, so both then assume
   2 MiB, what Rust gives the threads it spawns, rather than the main
-  thread's usual 8 MiB: limits are then hit sooner, but never past the
-  end of the stack.
+  thread's usual 8 MiB: limits are then hit sooner. These checks only
+  hold if the size is right: a caller that runs them on a thread with
+  less than 2 MiB of stack left (a smaller thread, or deep in its own
+  recursion) must pass the real size to `parse_with_stack` and
+  `Config::stack_size`, or deep input may still overflow its stack.
 
 ## Regex (phase 6)
 
