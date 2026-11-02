@@ -63,10 +63,13 @@ How the runners judge progress: `tests/corpus/PASSING` and `REGEX_PASSING`
 list the cases hawk passed last time. A run fails only if one of those cases
 fails now, which is a regression. After an improvement, record it with
 `--update-passing`. Each runner takes `--awk CMD` to test another awk
-instead. `tools/ast_check.py` compares hawk's parse of every corpus program
-with pyawk v1.0's, using the hidden `hawk --dump-ast` flag (regress.sh runs
-it when a pyawk checkout sits next to this repository). That is how the harness itself was checked: pyawk passes 504 of
+instead. That is how the harness itself was checked: pyawk passes 504 of
 504 corpus cases and 570 of 570 regex patterns.
+
+`tools/ast_check.py` compares hawk's parse of every corpus program with
+pyawk v1.0's, using the hidden `hawk --dump-ast` flag (regress.sh runs it
+when a pyawk checkout sits next to this repository, and says so when it
+skips it).
 
 ## Layout
 
