@@ -156,6 +156,11 @@ resolved to slots or cached at load time without changing the interface.
   used (at most half the thread's stack); past 20,100 levels (5,000
   nested parentheses, as many as gawk takes) or the stack budget it stops
   with "syntax error ...: nesting too deep" instead of overflowing.
+  Operator chains such as `1+1+...+1` are parsed by loops, but build a
+  tree as deep as the chain is long, which the interpreter (and freeing
+  the tree) recurse over; so each link counts as a level too, until the
+  enclosing expression ends. A chain of 4 million terms used to overflow
+  the 1 GiB stack; now chains past about 20,000 terms are a syntax error.
 
 ## Regex (phase 6)
 
@@ -331,7 +336,9 @@ once hawk has found that prefix.
   exits 2, as gawk, mawk and onetrue-awk do.
 * **Deep nesting.** pyawk v1.0 fails (Python's recursion limit) before
   1,000 nested parentheses; hawk accepts up to 5,000 and reports anything
-  deeper as a syntax error.
+  deeper as a syntax error. Likewise for operator chains: pyawk v1.0
+  fails before 1,000 terms of `1+1+...`, onetrue-awk's parser stack
+  before 100,000; hawk takes about 20,000 (gawk and mawk take millions).
   In a regex, nesting is "too deeply nested" past 2,000 levels;
   pyawk v1.0 gives up at 500 nested groups.
 * **Misplaced parenthesised lists.** A list `(a, b)` is valid only right

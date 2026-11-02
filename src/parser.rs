@@ -236,10 +236,27 @@ impl Parser {
         if self.depth >= MAX_NESTING || used > self.stack_budget {
             return Err(self.error("nesting too deep"));
         }
+        // Restore the depth rather than subtracting one: any chain links
+        // ([`Parser::link`]) made at this level are given back too.
+        let depth = self.depth;
         self.depth += 1;
         let result = parse(self);
-        self.depth -= 1;
+        self.depth = depth;
         result
+    }
+
+    /// One more link in a left-nested chain such as `1 + 2 + 3` (that is
+    /// `(1 + 2) + 3`), which the operator loops build without recursing.
+    /// The tree is still as deep as the chain is long, and the interpreter,
+    /// like the code that frees the tree, recurses over that depth, so each
+    /// link counts towards the nesting limit until the enclosing
+    /// [`Parser::nested`] call returns.
+    fn link(&mut self) -> Result<(), Error> {
+        if self.depth >= MAX_NESTING {
+            return Err(self.error("nesting too deep"));
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     // ------------------------------------------------------------ utilities
@@ -989,6 +1006,7 @@ impl Parser {
         // Left-associative levels use a loop: a || b || c is (a || b) || c.
         let mut left = self.parse_and()?;
         while self.accept(&Tok::Or) {
+            self.link()?;
             self.skip_newlines();
             let right = self.parse_and()?;
             left = Expr::Or(bx(left), bx(self.maybe_assign(right)?));
@@ -999,6 +1017,7 @@ impl Parser {
     fn parse_and(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_in()?;
         while self.accept(&Tok::And) {
+            self.link()?;
             self.skip_newlines();
             let right = self.parse_in()?;
             left = Expr::And(bx(left), bx(self.maybe_assign(right)?));
@@ -1009,6 +1028,7 @@ impl Parser {
     fn parse_in(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_match()?;
         while self.accept(&Tok::In) {
+            self.link()?;
             // `(i, j) in arr` tests the multi-dimensional key i SUBSEP j.
             let subs = match left {
                 Expr::Group(items) => {
@@ -1029,6 +1049,7 @@ impl Parser {
     fn parse_match(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_comparison()?;
         while matches!(self.tok(), Tok::Tilde | Tok::NoMatch) {
+            self.link()?;
             let negate = self.advance().tok == Tok::NoMatch;
             let right = self.parse_comparison()?;
             let regex = bx(self.maybe_assign(right)?);
@@ -1059,6 +1080,7 @@ impl Parser {
     fn parse_pipe_getline(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_concat()?;
         while self.at(&Tok::Pipe) && self.peek(1) == &Tok::Getline {
+            self.link()?;
             self.advance();
             self.advance();
             let target = self.parse_optional_lvalue()?;
@@ -1080,6 +1102,7 @@ impl Parser {
             // `cmd | getline x y` is `(cmd | getline x) y`: the result may be
             // concatenated with what follows (all three references).
             while starts_concat(self.tok()) {
+                self.link()?;
                 let right = self.parse_additive()?;
                 left = Expr::Concat(bx(left), bx(right));
             }
@@ -1094,6 +1117,7 @@ impl Parser {
     fn parse_concat(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_additive()?;
         while starts_concat(self.tok()) {
+            self.link()?;
             let right = self.parse_additive()?;
             left = Expr::Concat(bx(left), bx(right));
         }
@@ -1113,6 +1137,7 @@ impl Parser {
                 Tok::Minus => BinOp::Sub,
                 _ => return Ok(left),
             };
+            self.link()?;
             self.advance();
             let right = self.parse_multiplicative()?;
             left = Expr::Binary(op, bx(left), bx(right));
@@ -1133,6 +1158,7 @@ impl Parser {
                 Tok::Percent => BinOp::Mod,
                 _ => return Ok(left),
             };
+            self.link()?;
             self.advance();
             let right = self.parse_unary()?;
             left = Expr::Binary(op, bx(left), bx(right));
@@ -2011,6 +2037,39 @@ mod tests {
                 .unwrap();
             assert_eq!(parsed, None);
         }
+    }
+
+    #[test]
+    fn long_operator_chains_are_an_error_not_a_crash() {
+        // `1+1+1+...` is parsed by a loop, not recursion, but still builds
+        // a tree as deep as the chain is long, and the interpreter (and
+        // freeing the tree) recurse over that depth.  So chain links count
+        // towards the nesting limit as well.
+        let too_deep = "syntax error at source line 1: nesting too deep";
+        let n = 1_000_000;
+        let cases = [
+            format!("BEGIN {{ x = 1{} }}", "+1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "*1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", " 1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "&&1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "||1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "~1".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", " in a".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "|getline".repeat(n)),
+            format!("BEGIN {{ x = 1{} }}", "+1*1".repeat(n)),
+        ];
+        for src in cases {
+            let head: String = src.chars().take(30).collect();
+            let msg = parse_on_small_stack(src).unwrap_or_default();
+            assert!(msg.starts_with(too_deep), "{head}: {msg}");
+        }
+        // Long but sane chains are fine (pyawk fails before 1,000 terms).
+        let src = format!(
+            "BEGIN {{ x = 1{}; y = 1{} }}",
+            "+1".repeat(10_000),
+            " 1".repeat(10_000)
+        );
+        assert_eq!(parse_on_small_stack(src), None);
     }
 
     #[test]
