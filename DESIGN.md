@@ -33,7 +33,7 @@ source bytes --lexer.rs--> Vec<Token> --parser.rs--> ast.rs --interp.rs--> outpu
 | `ast.rs` | expression and statement enums | 2 |
 | `parser.rs` | recursive descent, one function per precedence level | 2 |
 | `value.rs` | `Value` (number / string / strnum / uninit), conversions, comparison | 3 |
-| `format.rs` | `printf` formatting; an interim version now, made glibc-exact in phase 5 | 3 / 5 |
+| `format.rs` | `printf` formatting; checked against the C library (a 17,939-case table) | 3 / 5 |
 | `array.rs` | AWK arrays: insertion-ordered hash maps | 3 |
 | `interp.rs` | the tree-walking interpreter: variables, expressions, statements, functions, main loop, records and fields, builtins | 3–7 |
 | `input.rs` | record reading for every kind of `RS` | 4 |
@@ -190,7 +190,7 @@ match next to the previous match is skipped, so `gsub(/x*/, "-", "abc")` is
 `-a-b-c-`), and splitting at a regex (at non-empty matches only).
 
 The FS and split rules: `" "` splits at runs of blanks, tabs and newlines;
-any other single byte, regex-special or not (`|`, `.`, `\\`), is a literal
+any other single byte, regex-special or not (`|`, `.`, `\`), is a literal
 separator; `""` gives one field per byte; anything longer is a regex. In
 paragraph mode (`RS = ""`) newline is a separator as well (the regex becomes
 `\n|(FS)`). A multi-byte RS is a regex: hawk reads the whole input first
@@ -207,16 +207,27 @@ character offsets at the interpreter boundary.
 
 ## printf and numbers (phase 5)
 
-Until phase 5, `format.rs` holds an *interim* formatter, clearly marked as
-such in its comments: it uses Rust's own float formatting (which is exact
-and rounds ties to even, as glibc does) and covers the common
-conversions. Phase 5 replaces or audits it against a C `printf` table.
+Rust's `format!` is not C's `printf`, but its float formatting with an
+explicit precision (`{:.17e}`, `{:.60}`) is exact: it expands the double's
+true binary value and rounds an exact tie to even, which is what glibc
+does. So `format.rs` takes the digits from there and adds C's layout
+itself: the exponent style (`e+05`, at least two digits), `%g`'s choice
+between the `e` and `f` styles and its zero stripping, flags `-+ #0`,
+width and precision (also from `*`), `inf`/`nan` spelled `+inf`/`-nan` as
+gawk and pyawk do, and `%c` with a number or a string. Integers follow C
+(`%.0d` of 0 prints nothing, `0` is ignored with a precision, negative
+numbers are reinterpreted as unsigned 64-bit by `%u %o %x %X`); integers
+too big for 128 bits are printed exactly with a small bignum, as pyawk does
+with Python integers (C would overflow).
 
-Rust's `format!` is not C's `printf`. hawk has a hand-written formatter
-that reproduces glibc output for the conversions AWK uses, including
-`%g` precision and exponent rules, `%.30g`, rounding (exact decimal
-expansion of the double, round-half-even on ties, as glibc does), `inf`
-and `nan`, flags `-+ #0`, `*` widths, and `%c` with a number or a string.
+`tools/printf_table.py` compiles a C program that records the C library's
+`snprintf` output for about 18,000 (format, value) pairs: 58 float formats
+over 295 doubles (ties, powers of ten, subnormals, the largest double,
+random bit patterns, up to `%.1000f`), 35 integer formats and 9 string
+formats. The table is committed (`tests/data/printf_table.tsv`) and the
+unit test `matches_the_c_library` checks every line, so the test needs no
+C compiler. hawk agrees with glibc on all of them but one family (below).
+
 Number parsing follows `strtod` for the AWK subset: leading blanks, sign,
 digits, `.`, exponent, the longest valid prefix. Rust's
 `str::parse::<f64>` is correctly rounded, so it does the final conversion
@@ -267,5 +278,10 @@ once hawk has found that prefix.
   identifiers accept only ASCII letters, digits and `_`, as POSIX
   specifies. pyawk v1.0 used Python's `str.isidentifier()`, which also
   accepts non-ASCII letters for `-v`.
+* **`%#g` rounding up to a power of ten.** glibc prints
+  `printf "%#g", 999999.5` as `1.e+06` (it keeps the precision of the `f`
+  style it first chose); C and POSIX ask for `1.00000e+06`, which pyawk
+  prints, and so does hawk. gawk, mawk and onetrue-awk show the glibc
+  output since they call it.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.

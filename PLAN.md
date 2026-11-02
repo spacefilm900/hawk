@@ -87,3 +87,9 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
   (with paragraph mode) and regex RS. Corpus 504/0/123 (golden 99/99,
   onetrue 215/0/9, gawk 190/0/114); regex patterns 570/570 (13,503 lines
   agree). `tools/bench.py` added for phase 8.
+* Phase 5: the formatter in `format.rs` audited against the C library:
+  `tools/printf_table.py` records 17,939 glibc `snprintf` answers
+  (`tests/data/printf_table.tsv`) and a unit test checks every one. All
+  agree except glibc's `%#g` slip when rounding up to a power of ten,
+  where hawk keeps pyawk's (and the C standard's) answer. Integers beyond
+  128 bits are now exact (`%o` of 1e40 printed a saturated value before).

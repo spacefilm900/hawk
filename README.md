@@ -17,7 +17,8 @@ came first, and it uses the same test corpus and the same semantic decisions.
 
 **Status:** the lexer, parser, interpreter and the POSIX regex engine are
 done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570
-regex patterns. `printf` still uses an interim formatter (phase 5). See
+regex patterns, and its `printf` agrees with the C library on an
+18,000-case table (`tools/printf_table.py`). See
 PLAN.md for progress and the current test numbers, and `tools/bench.py` for
 a rough speed comparison with other awks.
 
@@ -79,7 +80,7 @@ it when a pyawk checkout sits next to this repository). That is how the harness 
 | `src/ast.rs` | the syntax tree, and its canonical text dump |
 | `src/parser.rs` | tokens to syntax tree (recursive descent), parse-time checks |
 | `src/value.rs` | AWK values: numbers, strings, strnums; conversions and comparison |
-| `src/format.rs` | `printf` formatting (interim until phase 5) |
+| `src/format.rs` | `printf` formatting, checked against the C library |
 | `src/interp.rs` | the interpreter: walks the syntax tree |
 | `src/array.rs` | insertion-ordered AWK arrays |
 | `src/input.rs` | record reading (`RS`) |
