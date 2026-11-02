@@ -15,8 +15,8 @@ came first, and it uses the same test corpus and the same semantic decisions.
   pyawk). The v1.1 extras come later: UTF-8 locales, `ENVIRON` and the full
   I/O audit, `nextfile`, and the POSIX regex engine. See [PLAN.md](PLAN.md).
 
-**Status:** phase 0 (bootstrap). hawk does not run AWK
-programs yet. See PLAN.md for progress and the current test numbers.
+**Status:** phase 1 (lexer) done; the parser is next. hawk does not run
+AWK programs yet. See PLAN.md for progress and the current test numbers.
 
 ## Building
 
@@ -69,6 +69,8 @@ instead. That is how the harness itself was checked: pyawk passes 504 of
 | `src/main.rs` | the executable: hands the command line to the library |
 | `src/lib.rs` | the library root; declares the modules |
 | `src/cli.rs` | command-line options |
+| `src/error.rs` | the error type: syntax errors with a source line, runtime errors |
+| `src/lexer.rs` | program text to tokens; string escapes |
 | `DESIGN.md` | architecture and Rust notes |
 | `PLAN.md` | phased plan and progress |
 | `docs/pyawk-v1.0-DESIGN.md` | pyawk's design notes at v1.0: the semantic decisions hawk follows |

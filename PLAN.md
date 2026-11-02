@@ -10,7 +10,7 @@ commit.
 | # | Phase | Contents | Done when |
 |---|---|---|---|
 | 0 | Bootstrap | cargo crate, README/DESIGN/PLAN/LICENSE, corpus copied from pyawk, Python runners driving `target/release/hawk`, `tools/regress.sh`, baseline recorded | ✅ |
-| 1 | Lexer | tokens as an enum, keywords and builtins, `FUNC_NAME` (no space before `(`), newline and semicolon rules (newlines dropped after `, { && \|\| do else`, runs collapse, `\`-newline continuation, comments), regex-vs-division, regex literals (`\/`, `/` inside brackets, `[:class:]`), string escapes (shared with `-v`/`-F`/operands), numbers (`1e` is 1 then `e`), `**` and `**=`, line numbers for errors | unit tests port pyawk's `test_lexer.py` and more |
+| 1 | Lexer | tokens as an enum, keywords and builtins, `FUNC_NAME` (no space before `(`), newline and semicolon rules (newlines dropped after `, { && \|\| do else`, runs collapse, `\`-newline continuation, comments), regex-vs-division, regex literals (`\/`, `/` inside brackets, `[:class:]`), string escapes (shared with `-v`/`-F`/operands), numbers (`1e` is 1 then `e`), `**` and `**=`, line numbers for errors | unit tests port pyawk's `test_lexer.py` and more ✅ |
 | 2 | Parser and AST | recursive descent with pyawk's precedence table; concatenation vs unary minus; `no_gt` inside `print`; `(a,b)` groups and `(a,b) in arr`; `getline` forms; ranges; function definitions and calls; lvalues; the context checks (`return`, `break`/`continue`, `next`); syntax errors with line numbers | parses every corpus program the references accept, and rejects pyawk's syntax-error tests |
 | 3 | Values and core runtime | `Value` (num/str/strnum/uninit), number to string (integer rule, `CONVFMT`/`OFMT`), string to number (longest prefix), comparison rules; compile the AST to closures; variables as slots; expressions, assignment operators, `++`/`--`, `print` to stdout, `BEGIN`/`END`, `if`/`while`/`do`/`for`/`break`/`continue`/`exit`; control flow as an enum | `BEGIN`-only golden cases pass |
 | 4 | Fields and records, and the CLI | the main loop over operands and stdin, `var=value` operands, `RS` (single char, `""` paragraph mode, regex), `FS` (`" "`, single char, `""`, regex), `$n` read and assign, `NF` assignment, `$0` rebuild with `OFS`, `NR FNR FILENAME`, strnum fields; `next`; options `-F` (with escapes, `t`), `-v`, `-f` (repeatable, `-`), `--` | the `basic`, `fields` and `one_liners` golden categories pass |
@@ -44,3 +44,10 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
 ## Progress log
 
 * Phase 0: bootstrap and baseline.
+* Phase 1: `error.rs` (syntax/runtime errors, pyawk's message format) and
+  `lexer.rs` (`process_escapes`, `tokenize`). 16 unit tests: all of
+  pyawk's `test_lexer.py` plus CRLF continuation, string continuation,
+  line numbers, `[]/]`, `[^]/]`, `[[:alpha:]/]`, `.5`, `1.e2`, `1e999`,
+  `0x1A`, octal wrap (`"\501"` is `A`, checked against all three
+  references), and non-UTF-8 bytes. Corpus unchanged (41/463/123; regex
+  37/533): nothing runs programs yet.

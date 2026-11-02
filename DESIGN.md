@@ -160,3 +160,9 @@ once hawk has found that prefix.
 * **Bytes.** pyawk v1.0 decoded input as text. hawk works on bytes, so
   `length`, `substr` and `index` count bytes in v1.0 scope, which is the
   C-locale behaviour and what the corpus (run under `LC_ALL=C`) expects.
+* **Lexer details.** Numeric literals are converted to `f64` in the lexer
+  (pyawk kept the text). A non-ASCII byte in program text is reported as
+  `unexpected character '\xc3'` rather than as a decoded character. A
+  string literal continued with backslash-newline carries the line it
+  *starts* on (pyawk used the line it ended on); this only affects which
+  line a later error message names.
