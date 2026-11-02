@@ -1,0 +1,27 @@
+# CodeRabbit settings for the hawk review PR (main -> review-base).
+language: "en-US"
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    # The review PR targets review-base, not the default branch.
+    base_branches:
+      - ".*"
+  # Test data, not code: the AWK test corpus and the recorded C printf table.
+  path_filters:
+    - "!tests/corpus/**"
+    - "!tests/data/**"
+    - "!Cargo.lock"
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: >-
+        hawk is a zero-dependency (std only) Rust port of pyawk v1.0, a POSIX
+        AWK. Semantics follow pyawk v1.0; ties go to POSIX, otherwise to the
+        majority of onetrue-awk, gawk --posix and mawk. Deliberate
+        differences are listed in DESIGN.md. Data is handled as bytes.
+        Comments are written for readers new to Rust. Look for correctness
+        bugs, panics on hostile input, unbounded memory or time, and
+        divergence from POSIX awk behaviour.
