@@ -12,15 +12,19 @@
 //! may be used from outside this file (`pub`).  Pipeline, as in pyawk:
 //!
 //! ```text
-//! source --lexer--> tokens --parser--> AST --compiler--> closures --runtime--> output
+//! source --lexer--> tokens --parser--> AST --interp--> output
 //! ```
 //!
 //! See DESIGN.md for the architecture and PLAN.md for what is done.
 
+pub mod array;
 pub mod ast;
 pub mod cli;
 pub mod error;
 pub mod format;
+pub mod input;
+pub mod io;
 pub mod lexer;
 pub mod parser;
+pub mod rand;
 pub mod value;

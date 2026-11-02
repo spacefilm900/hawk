@@ -16,6 +16,9 @@ pub enum Error {
     Syntax { msg: String, line: Option<u32> },
     /// A fatal problem while the program runs.
     Runtime(String),
+    /// Standard output was closed by the reader (e.g. `hawk ... | head`):
+    /// the run stops quietly with status 2, as pyawk does.
+    BrokenPipe,
 }
 
 impl Error {
@@ -50,6 +53,7 @@ impl fmt::Display for Error {
             }
             Error::Syntax { msg, line: None } => write!(f, "syntax error: {msg}"),
             Error::Runtime(msg) => write!(f, "{msg}"),
+            Error::BrokenPipe => write!(f, "broken pipe"),
         }
     }
 }
