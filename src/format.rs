@@ -492,8 +492,13 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
                     if (0..256).contains(&c) {
                         vec![c as u8]
                     } else {
-                        char::from_u32(c as u32)
-                            .filter(|_| c < 0x110000)
+                        // `u32::try_from` fails for negative codes and
+                        // ones past 32 bits (`as u32` would keep the low
+                        // bits); `char::from_u32` then rejects anything
+                        // that is not a Unicode scalar value.
+                        u32::try_from(c)
+                            .ok()
+                            .and_then(char::from_u32)
                             .map(|ch| ch.to_string().into_bytes())
                             .unwrap_or_default()
                     }
@@ -675,6 +680,17 @@ mod tests {
         assert_eq!(f("%c", &[strnum]), "A");
         assert_eq!(f("[%c]", &[Value::Uninit]), "[\0]");
         assert_eq!(f("[%c]", &[]), "[]");
+    }
+
+    #[test]
+    fn char_of_out_of_range_codes_is_empty() {
+        // Like pyawk: a code below 0 or past U+10FFFF writes nothing, even
+        // when its low 32 bits would make a valid character.
+        assert_eq!(f("[%c]", &[n(-1.0)]), "[]");
+        assert_eq!(f("[%c]", &[n(-4294967231.0)]), "[]");
+        assert_eq!(f("[%c]", &[n(4294967361.0)]), "[]");
+        assert_eq!(f("[%c]", &[n(1114112.0)]), "[]");
+        assert_eq!(f("[%c]", &[n(1114111.0)]), "[\u{10FFFF}]");
     }
 
     #[test]
