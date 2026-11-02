@@ -140,7 +140,9 @@ resolved to slots or cached at load time without changing the interface.
   Output files are buffered too; if writing out the rest of a file's
   buffer fails when it is closed (by `close()` or at exit), that is a
   fatal "write error on NAME (reason)", exit status 2, since the data is
-  lost.
+  lost. For an output pipe, a command that stopped reading is not an error:
+  `close()` returns the command's exit status, as in pyawk, gawk and
+  onetrue-awk (mawk dies of SIGPIPE).
 * **Recursion.** The interpreter recurses on the native stack, so `cli.rs`
   runs it on a thread with a 1 GiB stack (reserved address space, not
   memory); if that much cannot be reserved (`ulimit -v`), it tries 256, 64
