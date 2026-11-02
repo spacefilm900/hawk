@@ -15,8 +15,8 @@ came first, and it uses the same test corpus and the same semantic decisions.
   pyawk). The v1.1 extras come later: UTF-8 locales, `ENVIRON` and the full
   I/O audit, `nextfile`, and the POSIX regex engine. See [PLAN.md](PLAN.md).
 
-**Status:** phase 1 (lexer) done; the parser is next. hawk does not run
-AWK programs yet. See PLAN.md for progress and the current test numbers.
+**Status:** phases 1 (lexer) and 2 (parser) done; the runtime is next. hawk
+does not run AWK programs yet. See PLAN.md for progress and the current test numbers.
 
 ## Building
 
@@ -59,7 +59,9 @@ How the runners judge progress: `tests/corpus/PASSING` and `REGEX_PASSING`
 list the cases hawk passed last time. A run fails only if one of those cases
 fails now, which is a regression. After an improvement, record it with
 `--update-passing`. Each runner takes `--awk CMD` to test another awk
-instead. That is how the harness itself was checked: pyawk passes 504 of
+instead. `tools/ast_check.py` compares hawk's parse of every corpus program
+with pyawk v1.0's, using the hidden `hawk --dump-ast` flag (regress.sh runs
+it when a pyawk checkout sits next to this repository). That is how the harness itself was checked: pyawk passes 504 of
 504 corpus cases and 570 of 570 regex patterns.
 
 ## Layout
@@ -71,6 +73,8 @@ instead. That is how the harness itself was checked: pyawk passes 504 of
 | `src/cli.rs` | command-line options |
 | `src/error.rs` | the error type: syntax errors with a source line, runtime errors |
 | `src/lexer.rs` | program text to tokens; string escapes |
+| `src/ast.rs` | the syntax tree, and its canonical text dump |
+| `src/parser.rs` | tokens to syntax tree (recursive descent), parse-time checks |
 | `DESIGN.md` | architecture and Rust notes |
 | `PLAN.md` | phased plan and progress |
 | `docs/pyawk-v1.0-DESIGN.md` | pyawk's design notes at v1.0: the semantic decisions hawk follows |

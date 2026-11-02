@@ -16,3 +16,8 @@ cargo test --quiet
 cargo build --quiet --release
 python3 tools/run_corpus.py "$@"
 python3 tools/regex_check.py
+# Parser parity with pyawk v1.0 on every corpus program (needs a pyawk
+# checkout next to this repository; skipped otherwise).
+if [ -d ../pyawk/.git ]; then
+    python3 tools/ast_check.py
+fi

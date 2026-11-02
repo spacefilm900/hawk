@@ -51,3 +51,16 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
   `0x1A`, octal wrap (`"\501"` is `A`, checked against all three
   references), and non-UTF-8 bytes. Corpus unchanged (41/463/123; regex
   37/533): nothing runs programs yet.
+* Phase 2: `ast.rs` (node types in pyawk's shapes, canonical dump) and
+  `parser.rs` (recursive descent, a port of pyawk v1.0's `parser.py`:
+  precedence with the concatenation, `in` and `cmd | getline` quirks,
+  assignment after `|| && ~ <`, `$` operand rules, print `>` redirection and
+  `print (a, b)`, `(i, j) in arr`, ranges, functions, and every parse-time
+  check with pyawk's messages). 38 parser unit tests (all of pyawk's
+  `test_parser.py` plus extras); 55 unit tests in total. Hidden flag
+  `hawk --dump-ast`; `tools/ast_check.py` compares it with pyawk v1.0 on all
+  627 corpus programs: 599 identical trees, 28 rejected by both with the
+  same message, 0 mismatches. Of the 28, 27 are rejected by the reference
+  majority; `gawk/getline.awk` (`cmd | getline x + 1`) is accepted by all
+  three references but rejected by pyawk v1.0 and so by hawk (the case is
+  skipped: the references disagree on its output). Corpus unchanged.
