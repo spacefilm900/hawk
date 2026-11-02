@@ -247,3 +247,21 @@ fn bad_regex_is_a_runtime_error() {
         "{e}"
     );
 }
+
+#[test]
+fn failed_writes_to_files_are_reported() {
+    // /dev/full accepts the open but fails every write (Linux).  The output
+    // is small, so it sits in hawk's buffer until the file is closed; the
+    // failure must still be reported, as gawk, mawk and onetrue-awk do.
+    if !std::path::Path::new("/dev/full").exists() {
+        return;
+    }
+    let msg = "hawk: write error on /dev/full (No space left on device)\n";
+    let (_, e, rc) = hawk(&["BEGIN { print \"x\" > \"/dev/full\" }"], "");
+    assert_eq!((e.as_str(), rc), (msg, 2));
+    let (o, e, rc) = hawk(
+        &["BEGIN { print \"x\" > \"/dev/full\"; close(\"/dev/full\"); print \"after\" }"],
+        "",
+    );
+    assert_eq!((o.as_str(), e.as_str(), rc), ("", msg, 2));
+}

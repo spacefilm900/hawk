@@ -224,14 +224,16 @@ impl Io {
     }
 
     /// `close(name)`: the command's exit status, 0 for a file, -1 if
-    /// nothing by that name is open.
-    pub fn close(&mut self, name: &[u8]) -> f64 {
+    /// nothing by that name is open.  Output still in a file's buffer is
+    /// written now; if that fails (a full disk, say) the data is lost, so
+    /// it is an error, as in gawk, mawk and onetrue-awk.
+    pub fn close(&mut self, name: &[u8]) -> Result<f64, Error> {
         let mut status = -1.0;
         if let Some(out) = self.outputs.remove(name) {
             let _ = self.stdout.flush();
             status = match out {
                 Output::File(mut w) => {
-                    let _ = w.flush();
+                    w.flush().map_err(|e| write_error(e, name))?;
                     0.0
                 }
                 Output::Pipe(mut child, mut w) => {
@@ -248,7 +250,7 @@ impl Io {
                 None => 0.0,
             };
         }
-        status
+        Ok(status)
     }
 
     /// `system(cmd)`: run a command, after flushing our own output so that
@@ -270,18 +272,26 @@ impl Io {
     }
 
     /// The end of the run: close every stream, then flush standard output.
+    /// Everything is closed even if one fails; the first failure is
+    /// returned.
     pub fn close_all(&mut self) -> Result<(), Error> {
+        let mut first_error = None;
         // Collect the names first: closing changes the maps being walked.
-        let names: Vec<Vec<u8>> = self.outputs.keys().cloned().collect();
+        let mut names: Vec<Vec<u8>> = self.outputs.keys().cloned().collect();
+        names.extend(self.inputs.keys().cloned());
         for name in names {
-            self.close(&name);
+            if let Err(e) = self.close(&name) {
+                // `get_or_insert` keeps the first error and ignores later ones.
+                first_error.get_or_insert(e);
+            }
         }
-        let names: Vec<Vec<u8>> = self.inputs.keys().cloned().collect();
-        for name in names {
-            self.close(&name);
-        }
-        self.stdout
+        let flushed = self
+            .stdout
             .flush()
-            .map_err(|e| write_error(e, b"/dev/stdout"))
+            .map_err(|e| write_error(e, b"/dev/stdout"));
+        match first_error {
+            Some(e) => Err(e),
+            None => flushed,
+        }
     }
 }

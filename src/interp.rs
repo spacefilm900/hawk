@@ -1531,7 +1531,7 @@ impl<'p> Interp<'p> {
             Close => {
                 Self::arity(b, args, 1, 1)?;
                 let name = self.str_arg(&args[0])?;
-                num(self.io.close(&name))
+                num(self.io.close(&name)?)
             }
             Fflush => {
                 Self::arity(b, args, 0, 1)?;
