@@ -189,6 +189,12 @@ struct Parser {
     /// parser may use (see `nested`).
     stack_base: usize,
     stack_budget: usize,
+    /// The token index of the `(` that opens a print/printf argument list,
+    /// as in `print (a, b) > "file"` (see `parse_group`).
+    print_group_at: Option<usize>,
+    /// True from when a parenthesised list followed by `in` is parsed until
+    /// that `in` takes it as its left operand (see `parse_group`).
+    group_awaits_in: bool,
 }
 
 /// The most `nested` levels allowed, whatever the stack size.  Each
@@ -211,6 +217,8 @@ impl Parser {
             depth: 0,
             stack_base: stack_position(),
             stack_budget: 0,
+            print_group_at: None,
+            group_awaits_in: false,
         }
     }
 
@@ -342,12 +350,44 @@ impl Parser {
 
     fn check_no_group(&self, e: &Expr) -> Result<(), Error> {
         if matches!(e, Expr::Group(_)) {
-            return Err(Error::syntax(
-                "parenthesised list is only valid before 'in' or after print",
-                self.line(),
-            ));
+            return Err(self.group_error());
         }
         Ok(())
+    }
+
+    fn group_error(&self) -> Error {
+        Error::syntax(
+            "parenthesised list is only valid before 'in' or after print",
+            self.line(),
+        )
+    }
+
+    /// A parenthesised list `(a, b)` that opened at token `start` has just
+    /// been read.  It is valid only directly before `in` (`(i, j) in arr`)
+    /// or as the whole argument list of print/printf (`print (a, b) >
+    /// "f"`); anywhere else (`1 + (a, b)`, `print ((a, b))`) it is a syntax
+    /// error now, as in gawk, mawk and onetrue-awk.
+    fn parse_group(&mut self, start: usize, exprs: Vec<Expr>) -> Result<Expr, Error> {
+        if self.at(&Tok::In) {
+            // `parse_in` checks that the `in` really gets the list itself,
+            // not `-(a, b)` or `1 + (a, b)`.
+            self.group_awaits_in = true;
+        } else {
+            let ends_print = matches!(
+                self.tok(),
+                Tok::Semicolon
+                    | Tok::Newline
+                    | Tok::RBrace
+                    | Tok::Eof
+                    | Tok::Gt
+                    | Tok::Append
+                    | Tok::Pipe
+            );
+            if !(ends_print && self.print_group_at == Some(start)) {
+                return Err(self.group_error());
+            }
+        }
+        Ok(Expr::Group(exprs))
     }
 
     // -------------------------------------------------------------- program
@@ -829,6 +869,9 @@ impl Parser {
                 | Tok::RParen
         );
         if !no_args {
+            if self.at(&Tok::LParen) {
+                self.print_group_at = Some(self.pos);
+            }
             args = self.with_no_gt(true, |p| p.parse_expr_list())?;
             // `print (a, b)` is the same as `print a, b`.
             if args.len() == 1
@@ -966,12 +1009,18 @@ impl Parser {
     fn parse_in(&mut self) -> Result<Expr, Error> {
         let mut left = self.parse_match()?;
         while self.accept(&Tok::In) {
-            let array = self.expect_name_use()?;
             // `(i, j) in arr` tests the multi-dimensional key i SUBSEP j.
             let subs = match left {
-                Expr::Group(items) => items,
+                Expr::Group(items) => {
+                    self.group_awaits_in = false;
+                    items
+                }
+                // The list before this `in` became an operand of something
+                // tighter first, as in `-(i, j) in arr`.
+                _ if self.group_awaits_in => return Err(self.group_error()),
                 other => vec![other],
             };
+            let array = self.expect_name_use()?;
             left = Expr::In(subs, array);
         }
         Ok(left)
@@ -1231,6 +1280,7 @@ impl Parser {
                 Ok(Expr::Field(bx(self.parse_field_operand()?)))
             }
             Tok::LParen => {
+                let start = self.pos;
                 self.advance();
                 let mut exprs = self.with_no_gt(false, |p| -> Result<Vec<Expr>, Error> {
                     p.skip_newlines();
@@ -1248,7 +1298,7 @@ impl Parser {
                 if exprs.len() == 1 {
                     return Ok(exprs.remove(0));
                 }
-                Ok(Expr::Group(exprs))
+                self.parse_group(start, exprs)
             }
             Tok::Name(name) => {
                 let t = self.advance();
@@ -1510,6 +1560,48 @@ mod tests {
             rhs("(1, 2) in a"),
             Expr::In(vec![n(1.0), n(2.0)], "a".into())
         );
+    }
+
+    #[test]
+    fn parenthesised_lists_are_checked_while_parsing() {
+        // Valid: before `in`, and as the whole argument list of print.
+        for good in [
+            "BEGIN { x = (1, 2) in a }",
+            "BEGIN { print ((1, 2) in a) }",
+            "BEGIN { print (1, 2) in a }",
+            "BEGIN { print (1, 2) }",
+            "BEGIN { print (1, 2)\n}",
+            "BEGIN { print (1, 2); printf (\"%s\", 1) }",
+            "BEGIN { print (1, 2) > \"f\"; print (1, 2) >> \"f\"; print (1, 2) | \"cat\" }",
+            "BEGIN { if ((1, 2) in a) print }",
+        ] {
+            if let Err(e) = parse(good.as_bytes()) {
+                panic!("{good}: {e}");
+            }
+        }
+        // Anywhere else it is a syntax error (gawk, mawk and onetrue-awk
+        // agree), not a run-time "used as a value" error.
+        for bad in [
+            "BEGIN { x = 1 + (1, 2) }",
+            "BEGIN { print -(1, 2) }",
+            "BEGIN { print (1, 2) (3) }",
+            "BEGIN { print (1, 2) \"\" }",
+            "BEGIN { print 1 ? (1, 2) : 3 }",
+            "BEGIN { if ((1, 2)) print }",
+            "BEGIN { print ((1, 2)) }",
+            "BEGIN { print !(1, 2) in a }",
+            "BEGIN { print 1 + (1, 2) in a }",
+            "BEGIN { print $(1, 2) in a }",
+            "BEGIN { f((1, 2)) }",
+        ] {
+            let e = err(bad);
+            assert!(
+                e.starts_with(
+                    "syntax error at source line 1: parenthesised list is only valid before 'in' or after print"
+                ),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]

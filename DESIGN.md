@@ -330,5 +330,11 @@ once hawk has found that prefix.
   deeper as a syntax error.
   In a regex, nesting is "too deeply nested" past 2,000 levels;
   pyawk v1.0 gives up at 500 nested groups.
+* **Misplaced parenthesised lists.** A list `(a, b)` is valid only right
+  before `in` or as print's whole argument list. pyawk v1.0 found other
+  uses only when running them ("parenthesised expression list used as a
+  value", and only if reached) and accepted `print ((a, b))`; hawk
+  rejects them all as syntax errors while parsing, as gawk, mawk and
+  onetrue-awk do.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.
