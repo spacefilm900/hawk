@@ -131,12 +131,23 @@ resolved to slots or cached at load time without changing the interface.
   the FS that was current when the record was read.
 * **Output** to stdout goes through a 64 KiB buffer, flushed before running
   a command, at exit, and after every write when stdout is a terminal.
+  Output files are buffered too; if writing out the rest of a file's
+  buffer fails when it is closed (by `close()` or at exit), that is a
+  fatal "write error on NAME (reason)", exit status 2, since the data is
+  lost.
 * **Recursion.** The interpreter recurses on the native stack, so `cli.rs`
   runs it on a thread with a 1 GiB stack (reserved address space, not
-  memory). Each user function call compares the stack position with the
-  start of the run and stops with pyawk's "function call nesting too deep
-  (runaway recursion?)" before the stack runs out (about 300 000 levels in
-  a release build), instead of crashing.
+  memory); if that much cannot be reserved (`ulimit -v`), it tries 256, 64
+  and 16 MiB, then the main thread. Each user function call compares the
+  stack position with the start of the run and stops with pyawk's
+  "function call nesting too deep (runaway recursion?)" before the stack
+  runs out (about 300 000 levels in a release build with 1 GiB), instead
+  of crashing.
+* **Nesting in the program text.** The parser recurses too. Every
+  recursive parsing function counts its depth and checks the stack it has
+  used (at most half the thread's stack); past 20,100 levels (5,000
+  nested parentheses, as many as gawk takes) or the stack budget it stops
+  with "syntax error ...: nesting too deep" instead of overflowing.
 
 ## Regex (phase 6)
 
@@ -299,5 +310,11 @@ once hawk has found that prefix.
   Rust's own formatting limit (65,535) still print exactly: the digits a
   double has are at most 1,074 decimals or 767 significant digits, and
   the rest are zeros.
+* **Write errors on close.** pyawk v1.0 ignores a failed flush when a
+  file is closed (`print > "/dev/full"` exits 0); hawk reports it and
+  exits 2, as gawk, mawk and onetrue-awk do.
+* **Deep nesting.** pyawk v1.0 fails (Python's recursion limit) before
+  1,000 nested parentheses; hawk accepts up to 5,000 and reports anything
+  deeper as a syntax error.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.

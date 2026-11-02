@@ -43,6 +43,7 @@ use crate::ast::{
     AssignOp, BinOp, CmpOp, Expr, Function, GetlineKind, Program, Redirect, Rule, Stmt, UnOp,
 };
 use crate::error::Error;
+use crate::interp::stack_position;
 use crate::lexer::{Builtin, Tok, Token, tokenize};
 
 /// The special variables.  POSIX forbids using one as a function name or a
@@ -55,8 +56,20 @@ const SPECIAL_VARS: &[&str] = &[
 
 /// Parse a whole program.  The entry point of this module.
 pub fn parse(source: &[u8]) -> Result<Program, Error> {
+    parse_with_stack(source, 0)
+}
+
+/// `parse`, on a thread whose stack is `stack_size` bytes (0: the usual
+/// 8 MiB).  The parser uses at most half of it, leaving the rest for the
+/// interpreter's own recursion over the deepest expressions.
+pub fn parse_with_stack(source: &[u8], stack_size: usize) -> Result<Program, Error> {
     let tokens = tokenize(source)?;
-    Parser::new(tokens).parse_program()
+    let mut parser = Parser::new(tokens);
+    parser.stack_budget = match stack_size {
+        0 => 8 << 20,
+        n => n,
+    } / 2;
+    parser.parse_program()
 }
 
 /// Can this token begin an operand of implicit concatenation?  `+ - !`
@@ -170,7 +183,20 @@ struct Parser {
     var_uses: Vec<(String, u32)>,
     /// Every user function call: name, number of arguments, line.
     calls: Vec<(String, usize, u32)>,
+    /// How deeply the recursive parsing functions are nested (see `nested`).
+    depth: usize,
+    /// Where the stack was when parsing began, and how much of it the
+    /// parser may use (see `nested`).
+    stack_base: usize,
+    stack_budget: usize,
 }
+
+/// The most `nested` levels allowed, whatever the stack size.  Each
+/// parenthesis costs four (expression, conditional, unary, postfix), so
+/// this is 5,000 nested parentheses and a little room for the statement
+/// around them, as many as gawk accepts; that keeps the tree, and the
+/// interpreter's recursion over it, within reason.
+const MAX_NESTING: usize = 20_100;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Parser {
@@ -182,7 +208,30 @@ impl Parser {
             loop_depth: 0,
             var_uses: Vec::new(),
             calls: Vec::new(),
+            depth: 0,
+            stack_base: stack_position(),
+            stack_budget: 0,
         }
+    }
+
+    /// Run `parse` one level deeper.  Every recursive parsing function goes
+    /// through here, so absurdly nested input (a million parentheses, say)
+    /// is a syntax error instead of a stack overflow, which would kill the
+    /// process.  Both the depth and the stack actually used are checked:
+    /// how much stack a level takes depends on the compiler and the build.
+    /// `impl FnOnce(&mut Self) -> ...` accepts any function or closure
+    /// taking the parser.
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        // `wrapping_sub` because the subtraction must not panic even if
+        // the stack were laid out unexpectedly; the check then just fails.
+        let used = self.stack_base.wrapping_sub(stack_position());
+        if self.depth >= MAX_NESTING || used > self.stack_budget {
+            return Err(self.error("nesting too deep"));
+        }
+        self.depth += 1;
+        let result = parse(self);
+        self.depth -= 1;
+        result
     }
 
     // ------------------------------------------------------------ utilities
@@ -539,6 +588,10 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, Error> {
+        self.nested(Self::parse_statement_body)
+    }
+
+    fn parse_statement_body(&mut self) -> Result<Stmt, Error> {
         match self.tok() {
             Tok::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Tok::Semicolon => {
@@ -832,6 +885,10 @@ impl Parser {
     /// ordinary expression, then checked to be assignable; recursing for
     /// the right side makes `a = b = 1` group as `a = (b = 1)`.
     fn parse_expr(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_expr_body)
+    }
+
+    fn parse_expr_body(&mut self) -> Result<Expr, Error> {
         let left = self.parse_ternary()?;
         if let Some(op) = assign_op(self.tok()) {
             if !left.is_lvalue() {
@@ -847,6 +904,10 @@ impl Parser {
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_ternary_body)
+    }
+
+    fn parse_ternary_body(&mut self) -> Result<Expr, Error> {
         let test = self.parse_or()?;
         if self.accept(&Tok::Question) {
             self.skip_newlines();
@@ -1030,6 +1091,10 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_unary_body)
+    }
+
+    fn parse_unary_body(&mut self) -> Result<Expr, Error> {
         // Unary minus binds looser than ^, so -2^2 is -(2^2) = -4.
         if let Some(op) = unary_op(self.tok()) {
             self.advance();
@@ -1049,6 +1114,10 @@ impl Parser {
     }
 
     fn parse_power_rhs(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_power_rhs_body)
+    }
+
+    fn parse_power_rhs_body(&mut self) -> Result<Expr, Error> {
         // The exponent may carry its own sign: 2^-1 is 0.5.
         if let Some(op) = unary_op(self.tok()) {
             self.advance();
@@ -1059,6 +1128,10 @@ impl Parser {
 
     /// Prefix `++x` / `--x` and postfix `x++` / `x--`.
     fn parse_postfix(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_postfix_body)
+    }
+
+    fn parse_postfix_body(&mut self) -> Result<Expr, Error> {
         if matches!(self.tok(), Tok::Incr | Tok::Decr) {
             let incr = self.advance().tok == Tok::Incr;
             let target = self.parse_postfix()?;
@@ -1115,6 +1188,10 @@ impl Parser {
     /// * a nested `$` takes a following `++`/`--` itself: `$$a++` is
     ///   `$(($a)++)`.
     fn parse_field_operand(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::parse_field_operand_body)
+    }
+
+    fn parse_field_operand_body(&mut self) -> Result<Expr, Error> {
         if matches!(self.tok(), Tok::Incr | Tok::Decr) {
             return self.parse_postfix();
         }
@@ -1788,6 +1865,60 @@ mod tests {
     fn loops_inside_functions_allow_break() {
         let prog = p("function f() { while (1) { break }; for (;;) continue }");
         assert_eq!(prog.function("f").unwrap().body.len(), 2);
+    }
+
+    /// Parse `src` on a thread with an 8 MiB stack (a typical main-thread
+    /// size, and what hawk falls back to), returning the error message, if
+    /// any.  A stack overflow would abort the whole test run.
+    fn parse_on_small_stack(src: String) -> Option<String> {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || parse(src.as_bytes()).err().map(|e| e.to_string()))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        let too_deep = "syntax error at source line 1: nesting too deep";
+        let n = 100_000;
+        let cases = [
+            format!("BEGIN {{ x = {}1{} }}", "(".repeat(n), ")".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "- ".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "!".repeat(n)),
+            format!("BEGIN {{ x = 2^{}1 }}", "- ".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "$".repeat(n)),
+            format!("BEGIN {{ x = {}y }}", "++".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "y = ".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "1 ? 1 : ".repeat(n)),
+            format!("BEGIN {}{}", "{".repeat(n), "}".repeat(n)),
+            format!("BEGIN {{ {} x }}", "if (1) ".repeat(n)),
+            format!("BEGIN {{ {} x }}", "while (1) ".repeat(n)),
+        ];
+        for src in cases {
+            let head: String = src.chars().take(30).collect();
+            // (The message goes on to say which token it was at.)
+            let msg = parse_on_small_stack(src).unwrap_or_default();
+            assert!(msg.starts_with(too_deep), "{head}: {msg}");
+        }
+        // Given hawk's big stack, ordinary depths are fine: as many
+        // parentheses as gawk accepts, more than mawk and pyawk (which fail
+        // at 1,000).
+        let n = 5000;
+        for src in [
+            format!("BEGIN {{ x = {}1{} }}", "(".repeat(n), ")".repeat(n)),
+            format!("BEGIN {}{}", "{".repeat(n), "}".repeat(n)),
+            format!("BEGIN {{ x = {}1 }}", "- ".repeat(n)),
+        ] {
+            let parsed = std::thread::Builder::new()
+                .stack_size(1 << 30)
+                .spawn(move || parse_with_stack(src.as_bytes(), 1 << 30).err())
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(parsed, None);
+        }
     }
 
     #[test]

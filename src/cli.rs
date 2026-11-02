@@ -203,7 +203,8 @@ fn on_big_stack<F: FnOnce(usize) -> i32 + Send + 'static>(job: F) -> i32 {
 }
 
 fn run(parsed: Parsed) -> i32 {
-    let result = crate::parser::parse(&parsed.source).and_then(|program| {
+    let stack_size = parsed.config.stack_size;
+    let result = crate::parser::parse_with_stack(&parsed.source, stack_size).and_then(|program| {
         for warning in &program.warnings {
             eprintln!("hawk: warning: {warning}");
         }
@@ -238,14 +239,16 @@ fn dump_ast(args: &[Vec<u8>]) -> i32 {
         }
     };
     // The parser recurses too, so it also gets the big stack.
-    on_big_stack(move |_| match crate::parser::parse(&parsed.source) {
-        Ok(program) => {
-            println!("{}", crate::ast::dump_program(&program));
-            0
-        }
-        Err(e) => {
-            eprintln!("hawk: {e}");
-            2
+    on_big_stack(move |stack_size| {
+        match crate::parser::parse_with_stack(&parsed.source, stack_size) {
+            Ok(program) => {
+                println!("{}", crate::ast::dump_program(&program));
+                0
+            }
+            Err(e) => {
+                eprintln!("hawk: {e}");
+                2
+            }
         }
     })
 }

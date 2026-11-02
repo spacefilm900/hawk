@@ -49,7 +49,7 @@ const STACK_MARGIN: usize = 4 << 20;
 /// hawk.)  Turning a reference into a number is safe; only *using* such a
 /// number as a pointer would need `unsafe`.
 #[inline(never)]
-fn stack_position() -> usize {
+pub(crate) fn stack_position() -> usize {
     let marker = 0u8;
     std::hint::black_box(&marker) as *const u8 as usize
 }
