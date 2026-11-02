@@ -26,6 +26,13 @@ use crate::error::Error;
 /// Largest repeat count in an interval (POSIX's RE_DUP_MAX).
 pub const DUP_MAX: u32 = 32767;
 
+/// The deepest syntax tree allowed: nested groups plus repeat operators
+/// stacked on one another (`a**`), counted along any one path.  The parser
+/// and the code that walks the tree recurse once per level, so without a
+/// limit `((((...))))` a million deep would overflow the stack.  mawk and
+/// pyawk give up at 500 nested groups; gawk crashes at 10,000.
+pub const MAX_DEPTH: u32 = 2000;
+
 /// A set of bytes, one bit per possible byte value (4 x 64 = 256 bits).
 /// `#[derive(...)]` asks the compiler to write the listed standard
 /// methods (copying, comparing, hashing, debug printing) for us.
@@ -103,7 +110,7 @@ pub fn parse(src: &[u8]) -> Result<Node, Error> {
     };
     let r = p.alt();
     match r {
-        Ok(node) if p.i == src.len() => Ok(node),
+        Ok((node, _)) if p.i == src.len() => Ok(node),
         // Only an unmatched `)` at depth 0 could stop `alt` early, and that
         // is a literal, so this cannot happen; be safe anyway.
         Ok(_) => Err(bad(src, "unexpected )")),
@@ -162,20 +169,37 @@ struct Parser<'a> {
 /// `Result<T, String>`: either a value or an error reason.
 type P<T> = Result<T, String>;
 
+/// A node with its height: the most nodes on a path from it down to a
+/// leaf.  Each parsing function returns one, so the depth is known as the
+/// tree is built, without walking it again.
+type Tree = (Node, u32);
+
+/// The height of a new node above `child_height`, or an error if that is
+/// too deep (see `MAX_DEPTH`).
+fn above(child_height: u32) -> P<u32> {
+    if child_height >= MAX_DEPTH {
+        return Err("too deeply nested".into());
+    }
+    Ok(child_height + 1)
+}
+
 impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.s.get(self.i).copied()
     }
 
     /// alternation: cat ('|' cat)*
-    fn alt(&mut self) -> P<Node> {
+    fn alt(&mut self) -> P<Tree> {
         let mut branches = Vec::new();
+        let mut height = 0;
         // A branch that consumed no text at all (`a||b`, `|a`, `(a|)`) is
         // an error, as in mawk and onetrue-awk; `^*|a` is fine.
         let mut empty_branch = false;
         loop {
             let start = self.i;
-            branches.push(self.cat()?);
+            let (branch, h) = self.cat()?;
+            branches.push(branch);
+            height = height.max(h);
             empty_branch |= self.i == start;
             if self.peek() != Some(b'|') {
                 break;
@@ -183,7 +207,7 @@ impl Parser<'_> {
             self.i += 1;
         }
         if branches.len() == 1 {
-            return Ok(branches.pop().unwrap());
+            return Ok((branches.pop().unwrap(), height));
         }
         if empty_branch {
             return Err("empty alternative".into());
@@ -196,39 +220,47 @@ impl Parser<'_> {
                     all.union(s);
                 }
             }
-            return Ok(Node::Set(all));
+            return Ok((Node::Set(all), 1));
         }
-        Ok(Node::Alt(branches))
+        Ok((Node::Alt(branches), above(height)?))
     }
 
     /// concatenation of postfix-repeated atoms.
-    fn cat(&mut self) -> P<Node> {
+    fn cat(&mut self) -> P<Tree> {
         let mut items = Vec::new();
+        let mut height = 0;
         while let Some(c) = self.peek() {
             if c == b'|' || (c == b')' && self.depth > 0) {
                 break;
             }
             if let Some(atom) = self.atom()? {
-                let node = self.postfix(atom)?;
+                let (node, h) = self.postfix(atom)?;
                 items.push(node);
+                height = height.max(h);
             }
         }
         Ok(match items.len() {
-            0 => Node::Empty,
-            1 => items.pop().unwrap(),
-            _ => Node::Cat(items),
+            0 => (Node::Empty, 1),
+            1 => (items.pop().unwrap(), height),
+            _ => (Node::Cat(items), above(height)?),
         })
     }
 
     /// One atom, or None when `^` swallowed a following `*` / `?`.
-    fn atom(&mut self) -> P<Option<Node>> {
+    fn atom(&mut self) -> P<Option<Tree>> {
         let c = self.s[self.i];
+        let leaf = |node| Ok(Some((node, 1)));
         match c {
             b'(' => {
                 self.i += 1;
+                // A group adds no node of its own, but each level of
+                // parsing recurses, so it counts toward the limit too.
+                if self.depth >= MAX_DEPTH {
+                    return Err("too deeply nested".into());
+                }
                 self.depth += 1;
                 let node = if self.peek() == Some(b')') {
-                    Node::Empty
+                    (Node::Empty, 1)
                 } else {
                     self.alt()?
                 };
@@ -244,7 +276,7 @@ impl Parser<'_> {
             b'^' => {
                 self.i += 1;
                 // Operators right after ^: `^*` and `^?` vanish, `^+` is ^.
-                let mut node = Some(Node::Bol);
+                let mut node = Some((Node::Bol, 1));
                 while let Some(op @ (b'*' | b'+' | b'?')) = self.peek() {
                     self.i += 1;
                     if op != b'+' {
@@ -255,48 +287,56 @@ impl Parser<'_> {
             }
             b'$' => {
                 self.i += 1;
-                Ok(Some(Node::Eol))
+                leaf(Node::Eol)
             }
             b'.' => {
                 self.i += 1;
-                Ok(Some(Node::Set(ByteSet::full())))
+                leaf(Node::Set(ByteSet::full()))
             }
             b'[' => {
                 self.i += 1;
-                Ok(Some(Node::Set(self.bracket()?)))
+                let set = self.bracket()?;
+                leaf(Node::Set(set))
             }
-            b'\\' => Ok(Some(Node::Set(ByteSet::single(self.escape())))),
+            b'\\' => {
+                let byte = self.escape();
+                leaf(Node::Set(ByteSet::single(byte)))
+            }
             _ => {
                 self.i += 1;
-                Ok(Some(Node::Set(ByteSet::single(c))))
+                leaf(Node::Set(ByteSet::single(c)))
             }
         }
     }
 
     /// Apply any postfix operators after an atom.
-    fn postfix(&mut self, mut node: Node) -> P<Node> {
+    fn postfix(&mut self, (mut node, mut height): Tree) -> P<Tree> {
         loop {
-            match self.peek() {
+            let (lo, hi) = match self.peek() {
                 Some(b'*') => {
                     self.i += 1;
-                    node = repeat(node, 0, None);
+                    (0, None)
                 }
                 Some(b'+') => {
                     self.i += 1;
-                    node = repeat(node, 1, None);
+                    (1, None)
                 }
                 Some(b'?') => {
                     self.i += 1;
-                    node = repeat(node, 0, Some(1));
+                    (0, Some(1))
                 }
                 Some(b'{') => match self.interval_at(self.i)? {
                     Some((lo, hi, end)) => {
                         self.i = end;
-                        node = repeat(node, lo, hi);
+                        (lo, hi)
                     }
-                    None => return Ok(node),
+                    None => return Ok((node, height)),
                 },
-                _ => return Ok(node),
+                _ => return Ok((node, height)),
+            };
+            node = repeat(node, lo, hi);
+            if matches!(node, Node::Repeat(..)) {
+                height = above(height)?;
             }
         }
     }
@@ -585,6 +625,44 @@ mod tests {
         assert_eq!(p(r"[\]]"), set_of(b"]"));
         let Node::Set(s) = p("[^a]") else { panic!() };
         assert!(!s.contains(b'a') && s.contains(b'\n') && s.len() == 255);
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        // Compile on an 8 MiB stack (a debug build, so frames are big): the
+        // limit must be reached long before the stack runs out.
+        let compile = |src: String| {
+            std::thread::Builder::new()
+                .stack_size(8 << 20)
+                .spawn(move || {
+                    let re = crate::regex::Regex::new(src.as_bytes());
+                    re.map(|re| re.is_match(b"a")).map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let n = 1_000_000;
+        for src in [
+            format!("{}a{}", "(".repeat(n), ")".repeat(n)),
+            format!("a{}", "*".repeat(n)),
+            format!("a{}", "?".repeat(n)),
+            "(a*".repeat(n / 2) + &")*".repeat(n / 2),
+        ] {
+            let err = compile(src).unwrap_err();
+            assert!(
+                err.ends_with("/: too deeply nested"),
+                "{}",
+                &err[err.len() - 40..]
+            );
+        }
+        // Depths up to the limit work: more than mawk and pyawk accept.
+        let n = MAX_DEPTH as usize - 1;
+        assert_eq!(
+            compile(format!("{}a{}", "(".repeat(n), ")".repeat(n))),
+            Ok(true)
+        );
+        assert_eq!(compile(format!("a{}", "*".repeat(n))), Ok(true));
     }
 
     #[test]

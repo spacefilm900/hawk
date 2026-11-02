@@ -160,7 +160,10 @@ and limits):
   at parse time into a `ByteSet` (256 bits), so `[[:alpha:]_-]`, ranges,
   negation, `[.x.]` and `[=x=]` all become one set. Intervals `{m,n}` are
   checked against `DUP_MAX` = 32767 and expanded by `repeat()`. Errors are
-  pyawk's: `bad regular expression /src/: why`.
+  pyawk's: `bad regular expression /src/: why`. The tree's depth (nested
+  groups and stacked repeats such as `a**`) is capped at `MAX_DEPTH` =
+  2,000, so `((((...))))` a million deep is "too deeply nested" rather
+  than a stack overflow; mawk and pyawk stop at 500 groups.
 * `nfa.rs`: the AST to a Thompson NFA (byte-set, split, `^`, `$`, match
   instructions). Its size is computed before it is built and capped at
   `NFA_LIMIT` = 1,000,000 instructions, as in pyawk, so `(a{1000}){1000}`
@@ -316,5 +319,7 @@ once hawk has found that prefix.
 * **Deep nesting.** pyawk v1.0 fails (Python's recursion limit) before
   1,000 nested parentheses; hawk accepts up to 5,000 and reports anything
   deeper as a syntax error.
+  In a regex, nesting is "too deeply nested" past 2,000 levels;
+  pyawk v1.0 gives up at 500 nested groups.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.
