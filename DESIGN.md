@@ -104,6 +104,11 @@ reference, and a variable can turn out to be an array only when a function
 uses it as one. So an array slot is `Rc<RefCell<Array>>`: shared
 ownership (`Rc`) of a value that may be changed through any of its owners
 (`RefCell` checks the borrowing rules at run time instead of compile time).
+Array keys come from the input, so the key index uses the standard
+library's randomly seeded hasher: input crafted so that every key lands in
+the same hash bucket (which made inserts quadratic with the unseeded FxHash
+used before) cannot be prepared in advance. FxHash is kept only for maps
+keyed by the program text (global variable names, the regex cache).
 
 ## Execution model (phase 3)
 

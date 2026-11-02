@@ -7,6 +7,12 @@
 //! so the array keeps its entries in a `Vec` (the order) plus a `HashMap`
 //! from key to position in that `Vec` (the fast lookup).  Deleting leaves a
 //! hole (`None`) that is cleaned up when holes pile up.
+//!
+//! Array keys come from input data, so the lookup map uses the standard
+//! library's hasher, which is seeded randomly per map: input crafted so its
+//! keys collide (making every lookup slow) cannot be prepared in advance.
+//! The faster, unseeded `FxMap` below is kept for maps keyed by the
+//! program text itself (variable names).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -19,8 +25,10 @@ pub type Key = Rc<[u8]>;
 
 /// A small, fast hash function (the "FxHash" used inside the Rust
 /// compiler).  The standard library's default hasher resists deliberate
-/// collision attacks, which an AWK interpreter does not need, at a cost in
-/// speed.  Writing our own keeps the zero-dependency rule.
+/// collision attacks at a cost in speed; that resistance is not needed for
+/// keys the program text chooses, such as variable names (array keys do
+/// need it; see the top of this file).  Writing our own keeps the
+/// zero-dependency rule.
 #[derive(Default, Clone, Copy)]
 pub struct FxHasher(u64);
 
@@ -43,7 +51,9 @@ pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 #[derive(Default, Debug)]
 pub struct Array {
-    index: FxMap<Key, usize>,
+    /// `HashMap<K, V>` with no third type parameter uses the standard,
+    /// randomly seeded hasher (`RandomState`).
+    index: HashMap<Key, usize>,
     entries: Vec<Option<(Key, Value)>>,
 }
 
@@ -160,5 +170,23 @@ mod tests {
         assert_eq!(a.get(b"99").unwrap().to_num(), 99.0);
         a.set(&k("1"), Value::Num(1.0));
         assert_eq!(a.keys().last().unwrap().as_ref(), b"1");
+    }
+
+    #[test]
+    fn colliding_keys_stay_fast() {
+        // Input data picks the keys, so a weak hash lets crafted input make
+        // every insert walk one long collision chain (quadratic time).
+        // These keys share their first three bytes, which made FxHash put
+        // them all in the same buckets.
+        let mut a = Array::new();
+        let start = std::time::Instant::now();
+        for i in 0..200_000u32 {
+            let [b0, b1, b2, _] = i.to_le_bytes();
+            let key: Key = Rc::from(&[b'a', b'b', b'c', b0, b1, b2, b'z', b'z'][..]);
+            a.set(&key, Value::Num(1.0));
+        }
+        assert_eq!(a.len(), 200_000);
+        let took = start.elapsed();
+        assert!(took.as_secs() < 10, "{took:?}");
     }
 }
