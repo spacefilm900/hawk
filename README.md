@@ -15,10 +15,11 @@ came first, and it uses the same test corpus and the same semantic decisions.
   pyawk). The v1.1 extras come later: UTF-8 locales, `ENVIRON` and the full
   I/O audit, `nextfile`, and the POSIX regex engine. See [PLAN.md](PLAN.md).
 
-**Status:** the lexer, parser and interpreter run AWK programs; regular
-expressions (phase 6) are next, and until then any regex use stops with
-"regular expressions are not supported yet". See PLAN.md for progress and
-the current test numbers.
+**Status:** the lexer, parser, interpreter and the POSIX regex engine are
+done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570
+regex patterns. `printf` still uses an interim formatter (phase 5). See
+PLAN.md for progress and the current test numbers, and `tools/bench.py` for
+a rough speed comparison with other awks.
 
 ## Building
 
@@ -84,6 +85,8 @@ it when a pyawk checkout sits next to this repository). That is how the harness 
 | `src/input.rs` | record reading (`RS`) |
 | `src/io.rs` | files, pipes, `close`, `system` |
 | `src/rand.rs` | `rand`/`srand`, identical to pyawk's |
+| `src/regex/` | the regex engine: ERE parser, NFA, lazy DFA, leftmost-longest search |
+| `src/subst.rs` | sub/gsub replacement and regex splitting |
 | `tests/run.rs` | end-to-end tests of the `hawk` binary |
 | `DESIGN.md` | architecture and Rust notes |
 | `PLAN.md` | phased plan and progress |

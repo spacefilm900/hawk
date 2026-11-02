@@ -141,15 +141,69 @@ resolved to slots or cached at load time without changing the interface.
 ## Regex (phase 6)
 
 hawk cannot use the `regex` crate (no dependencies), and that crate does not
-implement POSIX leftmost-longest matching anyway. hawk has its own
-engine in `src/regex/`. It parses ERE syntax into an AST, compiles that
-into a Thompson NFA, and runs it through a lazily built DFA. A DFA state is
-a set of NFA states, built on demand and cached with a size cap. Matching
-never backtracks, so no pattern can take exponential time. The engine
-returns the leftmost-longest match, as POSIX requires. Its design follows
-pyawk v1.1's engine, including the repeat-count limit of 32767 and an NFA
-state limit. The public interface is small (`Regex::new`, `is_match`,
-`find_at`) so the rest of the interpreter does not depend on the internals.
+implement POSIX leftmost-longest matching anyway. hawk has its own engine in
+`src/regex/`, modelled on pyawk v1.1's `regex.py` (semantics, error messages
+and limits):
+
+* `parse.rs`: ERE text to an AST (`Node`). Bracket expressions are resolved
+  at parse time into a `ByteSet` (256 bits), so `[[:alpha:]_-]`, ranges,
+  negation, `[.x.]` and `[=x=]` all become one set. Intervals `{m,n}` are
+  checked against `DUP_MAX` = 32767 and expanded by `repeat()`. Errors are
+  pyawk's: `bad regular expression /src/: why`.
+* `nfa.rs`: the AST to a Thompson NFA (byte-set, split, `^`, `$`, match
+  instructions). Its size is computed before it is built and capped at
+  `NFA_LIMIT` = 1,000,000 instructions, as in pyawk, so `(a{1000}){1000}`
+  is an error rather than a memory blow-up. The same AST also builds a
+  *reversed* NFA (used to find match starts, below).
+* `dfa.rs`: a lazy DFA. A state is the set of NFA instructions reachable
+  without consuming a byte; states and transitions are built only when a
+  byte is first seen in that state. Bytes the regex cannot tell apart share
+  one transition column (byte classes). When a DFA grows past `DFA_LIMIT` =
+  10,000 states its cache is flushed and rebuilt on demand, so memory stays
+  bounded while the run time stays linear.
+* `mod.rs`: `Regex` (`new`, `is_match`, `find_at`, `size`) and `Finder`,
+  a search over one text that remembers work between calls (gsub and split
+  call it repeatedly). `find_at` returns the *leftmost-longest* match: the
+  forward DFA runs anchored from each candidate start, remembering the last
+  accepting position. Candidates skip bytes that cannot begin a match. If
+  this gets expensive (more than 2n+64 steps on a text of n bytes), one pass
+  of the reversed DFA over the text marks every position where a match can
+  start, and the search jumps straight to the next mark. Pure literals of up
+  to 32 bytes skip the automata entirely.
+
+Nothing backtracks, so no pattern can take exponential time; one match is
+linear in the text. A loop of matches can still be quadratic for patterns
+like `a*b|a` on `aaaa…`: finding the *longest* match at each start may have
+to read to the end of the text before settling on a short one. That is
+inherent to leftmost-longest (mawk and gawk share it).
+
+The interpreter keeps compiled regexes in a cache keyed by source text, for
+`/literals/` and dynamic (string) regexes alike, capped at 512 entries and
+`NFA_LIMIT` NFA instructions in total; when either cap is hit the cache is
+cleared, as pyawk does.
+
+`src/subst.rs` holds what sits on top of matching: sub/gsub replacement
+text (in the replacement's string value, `&` is the match, `\&` a literal
+`&` and `\\` a backslash: mawk's and pyawk's rule for backslash runs; in
+program text `"\\&"` is the literal `&`), the empty-match rules for gsub (an empty
+match next to the previous match is skipped, so `gsub(/x*/, "-", "abc")` is
+`-a-b-c-`), and splitting at a regex (at non-empty matches only).
+
+The FS and split rules: `" "` splits at runs of blanks, tabs and newlines;
+any other single byte, regex-special or not (`|`, `.`, `\\`), is a literal
+separator; `""` gives one field per byte; anything longer is a regex. In
+paragraph mode (`RS = ""`) newline is a separator as well (the regex becomes
+`\n|(FS)`). A multi-byte RS is a regex: hawk reads the whole input first
+(as pyawk does, so a match is never cut at a buffer boundary), and empty
+matches do not end a record.
+
+**The UTF-8 seam.** The engine works on bytes. Everything that knows about
+characters is in `parse.rs`: `.`, bracket expressions and classes become
+`ByteSet`s there. A UTF-8 mode would change only the parser, turning a
+character set into an alternation of byte sequences (the usual way to run
+UTF-8 through a byte automaton); the NFA, DFA and search would not change.
+`RSTART`/`RLENGTH` and `substr` would then convert byte offsets to
+character offsets at the interpreter boundary.
 
 ## printf and numbers (phase 5)
 

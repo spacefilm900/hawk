@@ -78,3 +78,12 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
   difference from pyawk v1.0). Everything still failing needs the regex
   engine (phase 6): golden 79/99, onetrue 159/56/9, gawk 136/54/114,
   corpus total 374/130/123; regex patterns unchanged at 37/533.
+* Phase 6: the regex engine in `src/regex/` (ERE parser, Thompson NFA,
+  lazy DFA with byte classes and a flushed state cache, leftmost-longest
+  search with a reverse-DFA fallback that keeps match loops linear for most
+  patterns; pyawk v1.1's limits and messages), `subst.rs` (sub/gsub, regex
+  split), and the wiring: `~ !~`, `/re/` patterns, dynamic regexes with a
+  capped cache, `match`/`RSTART`/`RLENGTH`, `sub`/`gsub`, `split`, regex FS
+  (with paragraph mode) and regex RS. Corpus 504/0/123 (golden 99/99,
+  onetrue 215/0/9, gawk 190/0/114); regex patterns 570/570 (13,503 lines
+  agree). `tools/bench.py` added for phase 8.
