@@ -116,6 +116,35 @@ pub enum Builtin {
 }
 
 impl Builtin {
+    /// The builtin's AWK name.
+    pub fn name(self) -> &'static str {
+        use Builtin::*;
+        match self {
+            Length => "length",
+            Substr => "substr",
+            Index => "index",
+            Split => "split",
+            Sub => "sub",
+            Gsub => "gsub",
+            Match => "match",
+            Sprintf => "sprintf",
+            Sin => "sin",
+            Cos => "cos",
+            Atan2 => "atan2",
+            Exp => "exp",
+            Log => "log",
+            Sqrt => "sqrt",
+            Int => "int",
+            Rand => "rand",
+            Srand => "srand",
+            Tolower => "tolower",
+            Toupper => "toupper",
+            System => "system",
+            Close => "close",
+            Fflush => "fflush",
+        }
+    }
+
     /// The builtin called `name`, if there is one.
     pub fn from_name(name: &str) -> Option<Builtin> {
         use Builtin::*;
