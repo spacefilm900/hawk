@@ -1,69 +1,209 @@
-//! Command-line entry point.
+//! Command line: `hawk [-F fs] [-v var=val]... ('prog' | -f file...) [operand...]`.
 //!
-//! For now (phase 0) hawk only knows `--version`; every other command line
-//! is rejected with exit status 2, the status pyawk and the reference awks
-//! use for errors.  The real option parser (`-F`, `-v`, `-f`, `--`) comes
-//! with the runtime (see PLAN.md).
+//! Options come first; the first argument that is not an option is the
+//! program text (unless `-f` gave program files) and everything after it is
+//! an operand (an input file or `var=value`), passed on as ARGV.  Errors are
+//! reported as "hawk: message" with exit status 2, as pyawk does.
+//!
+//! Arguments are bytes (`Vec<u8>`), not `String`s: on Unix a file name or
+//! an argument need not be valid UTF-8, and AWK passes them through as-is.
 
-use std::io::Write;
+use std::io::{Read, Write};
+
+use crate::error::Error;
+use crate::interp::{Config, Interp};
 
 /// The version string printed by `hawk --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+const USAGE: &str = "usage: hawk [-F fs][-v var=value][-f progfile | 'prog'][file ...]\n";
+
+/// The stack size of the interpreter thread.  Deeply recursive AWK
+/// functions recurse in the interpreter too; the main thread's default
+/// (often 8 MiB) would overflow long before AWK's own depth limit.  The
+/// memory is only reserved, not used, until the recursion needs it.
+const STACK_SIZE: usize = 1 << 30;
+
+/// What the options asked for.
+struct Parsed {
+    source: Vec<u8>,
+    config: Config,
+}
+
+/// `Err(Some(msg))` is a usage error; `Err(None)` means "done, exit 0"
+/// (after --version or --help).
+fn parse_args(args: &[Vec<u8>]) -> Result<Parsed, Option<String>> {
+    let mut config = Config::default();
+    let mut progfiles: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i][..];
+        if arg == b"--" {
+            i += 1;
+            break;
+        }
+        if arg == b"--version" || arg == b"-V" {
+            println!("hawk {VERSION}");
+            return Err(None);
+        }
+        if arg == b"-h" || arg == b"--help" {
+            print!("{USAGE}");
+            return Err(None);
+        }
+        if !arg.starts_with(b"-") || arg == b"-" {
+            break;
+        }
+        let flag = &arg[..2];
+        // The option's value: the rest of this argument ("-F:") or the
+        // next argument ("-F :").
+        let mut value = || -> Result<Vec<u8>, Option<String>> {
+            if arg.len() > 2 {
+                return Ok(arg[2..].to_vec());
+            }
+            i += 1;
+            match args.get(i) {
+                Some(v) => Ok(v.clone()),
+                None => Err(Some(format!(
+                    "option {} requires an argument",
+                    String::from_utf8_lossy(flag)
+                ))),
+            }
+        };
+        match flag {
+            b"-F" => {
+                let fs = value()?;
+                config.assignments.push((b"FS".to_vec(), fs));
+            }
+            b"-v" => {
+                let spec = value()?;
+                let ok = spec.iter().position(|&b| b == b'=').filter(|&eq| {
+                    let name = &spec[..eq];
+                    name.first()
+                        .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+                        && name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+                });
+                match ok {
+                    Some(eq) => config
+                        .assignments
+                        .push((spec[..eq].to_vec(), spec[eq + 1..].to_vec())),
+                    None => {
+                        return Err(Some(format!(
+                            "improper assignment: -v {}",
+                            String::from_utf8_lossy(&spec)
+                        )));
+                    }
+                }
+            }
+            b"-f" => progfiles.push(value()?),
+            _ => {
+                return Err(Some(format!(
+                    "unknown option {}",
+                    String::from_utf8_lossy(arg)
+                )));
+            }
+        }
+        i += 1;
+    }
+    let source = if !progfiles.is_empty() {
+        let mut chunks = Vec::new();
+        for path in &progfiles {
+            let text = if path == b"-" {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf).map(|_| buf)
+            } else {
+                use std::os::unix::ffi::OsStrExt;
+                std::fs::read(std::ffi::OsStr::from_bytes(path))
+            };
+            match text {
+                Ok(t) => chunks.push(t),
+                Err(e) => {
+                    return Err(Some(format!(
+                        "couldn't open file {}: {}",
+                        String::from_utf8_lossy(path),
+                        crate::io::strerror(&e)
+                    )));
+                }
+            }
+        }
+        chunks.join(&b'\n')
+    } else {
+        match args.get(i) {
+            Some(text) => {
+                i += 1;
+                text.clone()
+            }
+            None => return Err(Some("no program given".into())),
+        }
+    };
+    config.operands = args[i..].to_vec();
+    config.stack_size = STACK_SIZE;
+    Ok(Parsed { source, config })
+}
+
 /// Run hawk with `args` (the command line without the program name) and
 /// return the process exit status.
-///
-/// `&[String]` is a *slice*: a borrowed view of a list owned by the caller.
-/// Borrowing (rather than taking ownership) means the caller keeps its
-/// `Vec` and we promise not to change it.
-pub fn main(args: &[String]) -> i32 {
-    if args.first().map(String::as_str) == Some("--version") {
-        println!("hawk {VERSION}");
-        return 0;
-    }
-    if args.first().map(String::as_str) == Some("--dump-ast") {
+pub fn main(args: Vec<Vec<u8>>) -> i32 {
+    if args.first().map(|a| &a[..]) == Some(b"--dump-ast") {
         return dump_ast(&args[1..]);
     }
-    // `let _ =` deliberately ignores the result of the write: if stderr
-    // itself is broken there is nobody left to tell.
-    let _ = writeln!(std::io::stderr(), "hawk: not implemented yet");
-    2
+    let parsed = match parse_args(&args) {
+        Ok(p) => p,
+        Err(None) => return 0,
+        Err(Some(msg)) => {
+            eprint!("hawk: {msg}\n{USAGE}");
+            return 2;
+        }
+    };
+    // Run on a thread with a big stack (see STACK_SIZE).  `move` hands the
+    // parsed program over to the new thread; `join` waits for its result.
+    let worker = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(move || run(parsed));
+    match worker.map(|handle| handle.join()) {
+        Ok(Ok(status)) => status,
+        _ => {
+            eprintln!("hawk: internal error");
+            2
+        }
+    }
+}
+
+fn run(parsed: Parsed) -> i32 {
+    let result = crate::parser::parse(&parsed.source).and_then(|program| {
+        for warning in &program.warnings {
+            eprintln!("hawk: warning: {warning}");
+        }
+        let mut interp = Interp::new(&program, &parsed.config).map_err(|u| match u {
+            crate::interp::Unwind::Err(e) => e,
+            crate::interp::Unwind::Exit => Error::Runtime("exit".into()),
+        })?;
+        interp.run()
+    });
+    match result {
+        Ok(status) => status,
+        Err(Error::BrokenPipe) => 2,
+        Err(e) => {
+            let _ = std::io::stdout().flush();
+            eprintln!("hawk: {e}");
+            2
+        }
+    }
 }
 
 /// Hidden debugging aid: `hawk --dump-ast [-f progfile]... | 'program'`
 /// parses the program and prints the tree in the canonical dump format
 /// (see `ast::dump_program`), which `tools/ast_check.py` compares with
 /// pyawk's parse.  Several `-f` files are joined with newlines, as pyawk does.
-fn dump_ast(args: &[String]) -> i32 {
-    let mut source: Vec<u8> = Vec::new();
-    let mut files = 0;
-    let mut i = 0;
-    while i + 1 < args.len() && args[i] == "-f" {
-        match std::fs::read(&args[i + 1]) {
-            Ok(text) => {
-                if files > 0 {
-                    source.push(b'\n');
-                }
-                source.extend_from_slice(&text);
-                files += 1;
-            }
-            Err(e) => {
-                eprintln!("hawk: couldn't open file {}: {e}", args[i + 1]);
-                return 2;
-            }
+fn dump_ast(args: &[Vec<u8>]) -> i32 {
+    let parsed = match parse_args(args) {
+        Ok(p) => p,
+        Err(None) => return 0,
+        Err(Some(msg)) => {
+            eprintln!("hawk: {msg}");
+            return 2;
         }
-        i += 2;
-    }
-    if files == 0 {
-        match args.get(i) {
-            Some(text) => source = text.clone().into_bytes(),
-            None => {
-                eprintln!("hawk: no program given");
-                return 2;
-            }
-        }
-    }
-    match crate::parser::parse(&source) {
+    };
+    match crate::parser::parse(&parsed.source) {
         Ok(program) => {
             println!("{}", crate::ast::dump_program(&program));
             0

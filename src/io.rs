@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt; // `OsStr::from_bytes`: Unix names are bytes
 use std::os::unix::process::ExitStatusExt; // `.signal()` on exit statuses
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -73,6 +73,9 @@ pub struct Io {
     /// call per line would be slow.  It is flushed before running a command
     /// and at the end.
     pub stdout: BufWriter<io::Stdout>,
+    /// Standard output is a terminal: flush every write so that output
+    /// appears as soon as it is printed (as C stdio's line buffering does).
+    interactive: bool,
     /// The one reader for standard input, shared by the main input and
     /// `getline < "-"` so that neither loses data the other buffered.
     pub stdin: Option<RecordReader>,
@@ -104,6 +107,7 @@ impl Io {
     pub fn new() -> Io {
         Io {
             stdout: BufWriter::with_capacity(64 * 1024, io::stdout()),
+            interactive: io::stdout().is_terminal(),
             stdin: None,
             outputs: HashMap::new(),
             inputs: HashMap::new(),
@@ -119,9 +123,11 @@ impl Io {
 
     /// Write `data` to standard output.
     pub fn write_stdout(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.stdout
-            .write_all(data)
-            .map_err(|e| write_error(e, b"/dev/stdout"))
+        let mut result = self.stdout.write_all(data);
+        if self.interactive && result.is_ok() {
+            result = self.stdout.flush();
+        }
+        result.map_err(|e| write_error(e, b"/dev/stdout"))
     }
 
     /// Write `data` to the redirection `kind name`, opening it the first

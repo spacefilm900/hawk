@@ -23,6 +23,7 @@ pub mod cli;
 pub mod error;
 pub mod format;
 pub mod input;
+pub mod interp;
 pub mod io;
 pub mod lexer;
 pub mod parser;
