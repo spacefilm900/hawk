@@ -177,23 +177,22 @@ fn on_big_stack<F: FnOnce(usize) -> i32 + Send + 'static>(job: F) -> i32 {
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
     for size in STACK_SIZES {
         let mine = std::sync::Arc::clone(&slot);
-        let worker = std::thread::Builder::new()
-            .stack_size(size)
-            .spawn(move || mine.lock().unwrap().take().map(|job| job(size)));
-        match worker {
-            // The thread ran: `join` waits for it.  `Ok(Some(status))` is
-            // its exit status; `Err` means it panicked (the panic message
-            // has already been printed).
-            Ok(handle) => {
-                return match handle.join() {
-                    Ok(Some(status)) => status,
-                    _ => {
-                        eprintln!("hawk: internal error");
-                        2
-                    }
-                };
-            }
-            Err(_) => {}
+        let worker = std::thread::Builder::new().stack_size(size).spawn(move || {
+            // Take the job out first, so the lock is not held while it runs.
+            let job = mine.lock().unwrap().take();
+            job.map(|job| job(size))
+        });
+        // If the thread started, `join` waits for it.  `Ok(Some(status))` is
+        // its exit status; `Err` means it panicked (the panic message has
+        // already been printed).  If it did not start, try a smaller stack.
+        if let Ok(handle) = worker {
+            return match handle.join() {
+                Ok(Some(status)) => status,
+                _ => {
+                    eprintln!("hawk: internal error");
+                    2
+                }
+            };
         }
     }
     match slot.lock().unwrap().take() {
