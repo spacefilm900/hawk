@@ -29,4 +29,5 @@ pub mod lexer;
 pub mod parser;
 pub mod rand;
 pub mod regex;
+pub mod subst;
 pub mod value;
