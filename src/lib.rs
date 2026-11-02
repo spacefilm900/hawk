@@ -18,3 +18,5 @@
 //! See DESIGN.md for the architecture and PLAN.md for what is done.
 
 pub mod cli;
+pub mod error;
+pub mod lexer;
