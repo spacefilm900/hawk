@@ -591,6 +591,22 @@ impl Lexer<'_> {
         let mut i = self.pos + 1;
         let mut buf = Vec::new();
         let mut in_bracket = false;
+        // A regex cannot span lines, so a class's closing `:]` must be found
+        // before the end of this line.
+        // (A closure, as a backslash-newline continues the regex on the
+        // next line and the end has to be found again.)
+        let find_line_end = |from: usize| {
+            src[from.min(src.len())..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(src.len(), |n| from + n)
+        };
+        let mut line_end = find_line_end(i);
+        // Where the next `:]`, `.]` and `=]` are, found once and reused:
+        // searching afresh for every `[:` would take time proportional to
+        // the square of the line length on input such as `[[:[:[:[:...`.
+        // `None` means not searched yet; `Some(None)` means there is none.
+        let mut next_close: [Option<Option<usize>>; 3] = [None; 3];
         loop {
             let c = match self.at(i) {
                 None | Some(b'\n') => return Err(self.error("unterminated regular expression")),
@@ -601,6 +617,10 @@ impl Lexer<'_> {
             {
                 if d == b'/' {
                     buf.push(b'/');
+                } else if d == b'\n' {
+                    buf.extend_from_slice(&[c, d]);
+                    line_end = find_line_end(i + 2);
+                    next_close = [None; 3];
                 } else {
                     buf.extend_from_slice(&[c, d]);
                 }
@@ -616,8 +636,23 @@ impl Lexer<'_> {
                     // Copy a class such as [:alpha:] whole, so its ']' does
                     // not look like the end of the bracket expression.
                     // `kind @ pattern` binds the matched byte to `kind`.
-                    if let Some(close) = find(&src[i + 2..], &[kind, b']']) {
-                        let end = i + 2 + close + 2;
+                    let slot = &mut next_close[match kind {
+                        b':' => 0,
+                        b'.' => 1,
+                        _ => 2,
+                    }];
+                    // Search again only if the remembered one is behind us.
+                    let stale = match *slot {
+                        None => true,
+                        Some(Some(at)) => at < i + 2,
+                        Some(None) => false,
+                    };
+                    if stale {
+                        let from = (i + 2).min(line_end);
+                        *slot = Some(find(&src[from..line_end], &[kind, b']']).map(|n| from + n));
+                    }
+                    if let Some(Some(at)) = *slot {
+                        let end = at + 2;
                         buf.extend_from_slice(&src[i..end]);
                         i = end;
                         continue;
@@ -1065,6 +1100,17 @@ mod tests {
         assert_eq!(
             err(b"/a\n/"),
             "syntax error at source line 1: unterminated regular expression"
+        );
+        // A character class such as [:alpha:] must close on its own line;
+        // the regex may not run on to a `:]` further down the program.
+        assert_eq!(
+            err(b"/[[:a/\n:]]/"),
+            "syntax error at source line 1: unterminated regular expression"
+        );
+        // ... but a backslash-newline continues the regex on the next line.
+        assert_eq!(
+            toks("/a\\\n[[:alpha:]]/"),
+            [ere("a\\\n[[:alpha:]]"), Tok::Eof]
         );
         assert_eq!(
             err(b"a @ b"),
