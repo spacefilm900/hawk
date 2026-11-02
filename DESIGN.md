@@ -287,6 +287,11 @@ once hawk has found that prefix.
   C locale (the user's decision, in keeping with hawk working on bytes).
   pyawk v1.0 wrote the Unicode character, UTF-8 encoded (two bytes).
   Codes of 256 and up are still written as UTF-8, as pyawk does.
+* **`%c` of a numeric string or an unset variable.** A field such as
+  `65` is a numeric string, so `printf "%c", $1` writes `A`, and an unset
+  variable is the number 0, so it writes a NUL byte. This is POSIX, and
+  gawk, mawk and onetrue-awk all agree; pyawk v1.0 used the string (`6`,
+  and nothing). A missing argument still writes nothing, as in pyawk.
 * **Huge printf widths and precisions** are cut to 1,048,576 (2^20,
   `MAX_WIDTH` in `format.rs`) whether written in the format
   (`%99999999999d`) or given by `*` (the user's decision). pyawk v1.0

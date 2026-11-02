@@ -438,10 +438,10 @@ fn format_float(out: &mut Vec<u8>, spec: &Spec, x: f64) {
 pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut next = 0;
-    // A closure that hands out the next argument (or Uninit when they ran
+    // A closure that hands out the next argument (None when they ran
     // out).  `move` is not needed: it borrows `args` and `next`.
     let mut take = || {
-        let v = args.get(next).cloned().unwrap_or(Value::Uninit);
+        let v = args.get(next).cloned();
         next += 1;
         v
     };
@@ -463,40 +463,49 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
             continue;
         }
         if spec.width_star {
-            let w = to_c_int(take().to_num());
+            let w = to_c_int(take().unwrap_or(Value::Uninit).to_num());
             if w < 0 {
                 spec.minus = true;
             }
             spec.width = Some(w.unsigned_abs().min(MAX_WIDTH as u128) as usize);
         }
         if spec.prec_star {
-            let p = to_c_int(take().to_num());
+            let p = to_c_int(take().unwrap_or(Value::Uninit).to_num());
             spec.prec = (p >= 0).then(|| p.min(MAX_WIDTH as i128) as usize);
         }
         if !known {
             out.extend_from_slice(raw);
             continue;
         }
-        let v = take();
+        let arg = take();
+        // `%c` is the one conversion where a missing argument differs from
+        // an unset variable (see below); for the others both are 0 or "".
+        if spec.conv == b'c' {
+            let ch: Vec<u8> = match arg {
+                None => Vec::new(),
+                // An unset variable is the number 0: a NUL byte.
+                Some(Value::Uninit) => vec![0],
+                // A numeric string (such as a field "65") counts as a
+                // number here, as POSIX says: `|` matches either variant.
+                Some(Value::Num(n) | Value::StrNum(_, n)) => {
+                    let c = to_c_int(n);
+                    if (0..256).contains(&c) {
+                        vec![c as u8]
+                    } else {
+                        char::from_u32(c as u32)
+                            .filter(|_| c < 0x110000)
+                            .map(|ch| ch.to_string().into_bytes())
+                            .unwrap_or_default()
+                    }
+                }
+                Some(other) => other.to_str(convfmt).iter().take(1).copied().collect(),
+            };
+            pad(&mut out, &ch, &spec);
+            continue;
+        }
+        let v = arg.unwrap_or(Value::Uninit);
         match spec.conv {
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => format_int(&mut out, &spec, v.to_num()),
-            b'c' => {
-                let ch: Vec<u8> = match v {
-                    Value::Num(n) => {
-                        let c = to_c_int(n);
-                        if (0..256).contains(&c) {
-                            vec![c as u8]
-                        } else {
-                            char::from_u32(c as u32)
-                                .filter(|_| c < 0x110000)
-                                .map(|ch| ch.to_string().into_bytes())
-                                .unwrap_or_default()
-                        }
-                    }
-                    other => other.to_str(convfmt).iter().take(1).copied().collect(),
-                };
-                pad(&mut out, &ch, &spec);
-            }
             b's' => {
                 let s = v.to_str(convfmt);
                 let s = match spec.prec {
@@ -654,6 +663,18 @@ mod tests {
         assert_eq!(f("%s %s", &[n(0.1), n(3.0)]), "0.1 3");
         assert_eq!(f("%c%c%c", &[n(65.0), s("hello"), s("")]), "Ah");
         assert_eq!(f("%3c|%-3c", &[s("x"), n(66.0)]), "  x|B  ");
+    }
+
+    #[test]
+    fn char_of_numeric_strings_and_uninitialized_values() {
+        // A field such as "65" is a numeric string: %c uses its number, as
+        // POSIX says and gawk, mawk and onetrue-awk all do.  An unset
+        // variable is the number 0, so %c writes a NUL byte; a missing
+        // argument still writes nothing.
+        let strnum = Value::StrNum(b"65".as_slice().into(), 65.0);
+        assert_eq!(f("%c", &[strnum]), "A");
+        assert_eq!(f("[%c]", &[Value::Uninit]), "[\0]");
+        assert_eq!(f("[%c]", &[]), "[]");
     }
 
     #[test]
