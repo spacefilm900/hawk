@@ -58,6 +58,11 @@ impl fmt::Display for Error {
     }
 }
 
+/// Makes `Error` a standard Rust error (the trait's methods all have
+/// defaults), so library callers can box it as `Box<dyn std::error::Error>`
+/// or wrap it as the source of their own errors.
+impl std::error::Error for Error {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +85,15 @@ mod tests {
             Error::Runtime("division by zero".into()).to_string(),
             "division by zero"
         );
+    }
+
+    #[test]
+    fn is_a_standard_error() {
+        // `Box<dyn std::error::Error>` is Rust's "any error" type; `?`
+        // converts into it only for types that implement the trait.
+        fn fails() -> Result<(), Box<dyn std::error::Error>> {
+            Err(Error::Runtime("boom".into()))?
+        }
+        assert_eq!(fails().unwrap_err().to_string(), "boom");
     }
 }
