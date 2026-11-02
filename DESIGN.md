@@ -281,7 +281,18 @@ once hawk has found that prefix.
 * **`%#g` rounding up to a power of ten.** glibc prints
   `printf "%#g", 999999.5` as `1.e+06` (it keeps the precision of the `f`
   style it first chose); C and POSIX ask for `1.00000e+06`, which pyawk
-  prints, and so does hawk. gawk, mawk and onetrue-awk show the glibc
-  output since they call it.
+  prints, and so does hawk (the user's decision: follow POSIX here). gawk,
+  mawk and onetrue-awk show the glibc output since they call it.
+* **`%c` of 128 to 255** writes that single raw byte, as gawk does in the
+  C locale (the user's decision, in keeping with hawk working on bytes).
+  pyawk v1.0 wrote the Unicode character, UTF-8 encoded (two bytes).
+  Codes of 256 and up are still written as UTF-8, as pyawk does.
+* **Huge printf widths and precisions** are cut to 1,048,576 (2^20,
+  `MAX_WIDTH` in `format.rs`) whether written in the format
+  (`%99999999999d`) or given by `*` (the user's decision). pyawk v1.0
+  tried to honour them and could run out of memory. Precisions past
+  Rust's own formatting limit (65,535) still print exactly: the digits a
+  double has are at most 1,074 decimals or 767 significant digits, and
+  the rest are zeros.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.

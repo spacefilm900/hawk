@@ -21,6 +21,11 @@
 
 use crate::value::{Value, special_float_str};
 
+/// The largest width or precision used, whether written in the format
+/// (`%99999999999d`) or given by `*`: bigger ones are cut to this (1 MiB),
+/// so a typo cannot make hawk allocate gigabytes.
+const MAX_WIDTH: usize = 1 << 20;
+
 /// One parsed conversion.
 #[derive(Default, Clone)]
 struct Spec {
@@ -88,7 +93,7 @@ fn parse(fmt: &[u8]) -> Vec<Piece<'_>> {
             spec.width_star = true;
             j += 1;
         } else {
-            spec.width = digits(fmt, &mut j);
+            spec.width = digits(fmt, &mut j).map(|w| w.min(MAX_WIDTH));
         }
         if j < fmt.len() && fmt[j] == b'.' {
             j += 1;
@@ -96,7 +101,7 @@ fn parse(fmt: &[u8]) -> Vec<Piece<'_>> {
                 spec.prec_star = true;
                 j += 1;
             } else {
-                spec.prec = Some(digits(fmt, &mut j).unwrap_or(0));
+                spec.prec = Some(digits(fmt, &mut j).unwrap_or(0).min(MAX_WIDTH));
             }
         }
         if j < fmt.len() && (fmt[j].is_ascii_alphabetic() || fmt[j] == b'%') {
@@ -327,19 +332,45 @@ fn strip_zeros(s: &mut String) {
     }
 }
 
+/// `{a:.p$}` for any precision.  Rust's formatter rejects (panics on)
+/// precisions above 65535, so beyond FIXED_EXACT decimals, where every
+/// double's exact expansion has already ended (the smallest has 1074),
+/// the remaining digits are zeros added by hand.
+fn fixed(a: f64, p: usize) -> String {
+    const FIXED_EXACT: usize = 1100;
+    if p <= FIXED_EXACT {
+        return format!("{a:.p$}");
+    }
+    let mut s = format!("{a:.FIXED_EXACT$}");
+    s.extend(std::iter::repeat_n('0', p - FIXED_EXACT));
+    s
+}
+
+/// `{a:.p$e}` (Rust's style, `1.5e5`) for any precision; a double has at
+/// most 767 significant decimal digits, so past SCI_EXACT they are zeros.
+fn sci(a: f64, p: usize) -> String {
+    const SCI_EXACT: usize = 800;
+    if p <= SCI_EXACT {
+        return format!("{a:.p$e}");
+    }
+    let s = format!("{a:.SCI_EXACT$e}");
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    format!("{mant}{}e{exp}", "0".repeat(p - SCI_EXACT))
+}
+
 /// The digits of |x| for `%e %f %g` (no sign; x is finite).
 fn float_body(spec: &Spec, x: f64) -> String {
     let a = x.abs();
     let upper = spec.conv.is_ascii_uppercase();
     let p = spec.prec.unwrap_or(6);
     let mut s = match spec.conv {
-        b'f' | b'F' => format!("{a:.p$}"),
-        b'e' | b'E' => c_exponent(&format!("{a:.p$e}"), upper),
+        b'f' | b'F' => fixed(a, p),
+        b'e' | b'E' => c_exponent(&sci(a, p), upper),
         _ => {
             // %g: P significant digits; style e if the exponent is < -4
             // or >= P, otherwise style f; then trailing zeros go.
             let p = if p == 0 { 1 } else { p };
-            let e_form = format!("{a:.*e}", p - 1);
+            let e_form = sci(a, p - 1);
             let exp: i32 = e_form
                 .split_once('e')
                 .map_or(0, |(_, e)| e.parse().unwrap_or(0));
@@ -352,7 +383,7 @@ fn float_body(spec: &Spec, x: f64) -> String {
                 c_exponent(&format!("{m}e{rest}"), upper)
             } else {
                 let decimals = (p as i32 - 1 - exp).max(0) as usize;
-                let mut f = format!("{a:.decimals$}");
+                let mut f = fixed(a, decimals);
                 if !spec.hash {
                     strip_zeros(&mut f);
                 }
@@ -436,11 +467,11 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
             if w < 0 {
                 spec.minus = true;
             }
-            spec.width = Some(w.unsigned_abs().min(1 << 20) as usize);
+            spec.width = Some(w.unsigned_abs().min(MAX_WIDTH as u128) as usize);
         }
         if spec.prec_star {
             let p = to_c_int(take().to_num());
-            spec.prec = (p >= 0).then(|| p.min(1 << 20) as usize);
+            spec.prec = (p >= 0).then(|| p.min(MAX_WIDTH as i128) as usize);
         }
         if !known {
             out.extend_from_slice(raw);
@@ -639,6 +670,38 @@ mod tests {
         assert_eq!(f("100%% %5%|%z|%", &[]), "100% %|%z|%");
         assert_eq!(f("%*z|", &[n(3.0)]), "%*z|");
         assert_eq!(f("no conversions", &[n(1.0)]), "no conversions");
+    }
+
+    #[test]
+    fn huge_widths_and_precisions_are_capped() {
+        // Literal widths and precisions are capped like `*` ones, at
+        // MAX_WIDTH, instead of trying to allocate gigabytes.
+        let cap = MAX_WIDTH;
+        assert_eq!(f("%99999999999d", &[n(1.0)]).len(), cap);
+        assert_eq!(f("%*d", &[n(1e12), n(1.0)]).len(), cap);
+        assert_eq!(f("%-99999999999s|", &[s("x")]).len(), cap + 1);
+        assert_eq!(f("%.99999999999d", &[n(7.0)]).len(), cap);
+        // "0." then the capped number of decimals.
+        assert_eq!(f("%.99999999999f", &[n(0.5)]).len(), cap + 2);
+        assert_eq!(f("%.*f", &[n(1e12), n(0.5)]).len(), cap + 2);
+        // Precisions past 65535 (Rust's own limit) work for every style.
+        let long = f(
+            "%.70000f|%.70000e|%#.70000g|%.70000g",
+            &[n(0.1), n(1e300), n(2.5), n(1.0 / 3.0)],
+        );
+        let parts: Vec<&str> = long.split('|').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [70002, 70007, 70001, 56]
+        );
+        assert!(parts[0].starts_with("0.1000000000000000055511151231257827"));
+        assert!(parts[0].ends_with("000"));
+        assert!(parts[1].starts_with("1.0000000000000000525") && parts[1].ends_with("0e+300"));
+        // (lengths and digits as glibc prints them; %g drops the zeros)
+        assert_eq!(
+            parts[3],
+            "0.333333333333333314829616256247390992939472198486328125"
+        );
     }
 
     #[test]
