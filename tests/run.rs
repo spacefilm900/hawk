@@ -188,3 +188,62 @@ fn rand_matches_pyawk() {
         "0.844422\n0.134364 1\n"
     );
 }
+
+#[test]
+fn regex_matching_and_patterns() {
+    let prog = r#"/ba/ { print "y" } $2 !~ "^f" { print "n" } { print ($0 ~ "a.c") }"#;
+    assert_eq!(out(&[prog], "foo bar\nabc foo\n"), "y\nn\n0\n1\n");
+    assert_eq!(
+        out(
+            &[r#"{ print match($0, /o+/), RSTART, RLENGTH; print match($0, "z") RLENGTH }"#],
+            "foo\n"
+        ),
+        "2 2 2\n0-1\n"
+    );
+}
+
+#[test]
+fn sub_and_gsub() {
+    let prog = r#"{ n = gsub(/o/, "<&>"); print n, $0, NF
+                    x = "aaa"; sub(/a/, "\\&", x); print x
+                    y = "abxd"; gsub(/x*/, "-", y); print y
+                    a[1] = "q"; i = 1; sub(/q/, "Q", a[i++]); print a[1], i
+                    print gsub(/z/, "", $1), $0 }"#;
+    assert_eq!(
+        out(&[prog], "foo bar\n"),
+        "2 f<o><o> bar 2\n&aa\n-a-b-d-\nQ 2\n0 f<o><o> bar\n"
+    );
+}
+
+#[test]
+fn regex_split_fs_and_rs() {
+    assert_eq!(
+        out(&["-F", ":+", "{ print $2, NF }"], "a::b:::c\n"),
+        "b 3\n"
+    );
+    assert_eq!(out(&["-F", "|", "{ print $2 }"], "a|b\n"), "b\n");
+    assert_eq!(
+        out(
+            &[r#"{ n = split($0, A, /[,;]+/); print n, A[1], A[3] }"#],
+            "x,,y;z\n"
+        ),
+        "3 x z\n"
+    );
+    assert_eq!(
+        out(
+            &[r#"BEGIN { RS = "[0-9]+" } { printf "%s.", $0 }"#],
+            "a1b22c333d"
+        ),
+        "a.b.c.d."
+    );
+}
+
+#[test]
+fn bad_regex_is_a_runtime_error() {
+    let (o, e, rc) = hawk(&[r#"{ print "x" ~ "a{2,1}" }"#], "\n");
+    assert_eq!((o.as_str(), rc), ("", 2));
+    assert!(
+        e.contains("bad regular expression /a{2,1}/: interval {n,m} with m < n"),
+        "{e}"
+    );
+}

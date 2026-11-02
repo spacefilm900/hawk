@@ -26,10 +26,12 @@ use crate::array::{Array, FxMap, Key};
 use crate::ast::{BinOp, CmpOp, Expr, Function, GetlineKind, Program, Redirect, Stmt, UnOp};
 use crate::error::Error;
 use crate::format::format_printf;
-use crate::input::RecordReader;
+use crate::input::{RecordReader, RegexFinder};
 use crate::io::{Io, strerror};
 use crate::lexer::{Builtin, process_escapes};
 use crate::rand::Random;
+use crate::regex::{Finder, NFA_LIMIT, Regex};
+use crate::subst::{split_regex, substitute};
 use crate::value::{Value, compare, empty, num_to_str};
 
 /// An array shared by reference: `Rc` lets several owners (a global and a
@@ -133,6 +135,9 @@ enum Main {
     File(RecordReader),
 }
 
+/// Most compiled regexes kept in the cache (pyawk's CACHE_ENTRIES).
+const REGEX_CACHE_ENTRIES: usize = 512;
+
 /// The settings that come from the command line.
 #[derive(Default)]
 pub struct Config {
@@ -176,6 +181,12 @@ pub struct Interp<'p> {
     rng: Random,
     seed: f64,
 
+    /// Compiled regexes by source text, for /literals/ and dynamic ones
+    /// alike.  Capped like pyawk's cache: at most REGEX_CACHE_ENTRIES
+    /// entries and NFA_LIMIT NFA states in all; when full it starts over.
+    regexes: FxMap<Vec<u8>, Rc<Regex>>,
+    regex_states: u64,
+
     /// `stack_position()` when the run started, and how much stack the
     /// interpreter may use below it.
     stack_base: usize,
@@ -217,6 +228,8 @@ impl<'p> Interp<'p> {
             range_open: vec![false; prog.rules.len()],
             rng: Random::new(0.0),
             seed: 0.0,
+            regexes: FxMap::default(),
+            regex_states: 0,
             stack_base: stack_position(),
             stack_budget: match config.stack_size {
                 0 => 8 << 20,
@@ -379,9 +392,12 @@ impl<'p> Interp<'p> {
                 return Ok(None);
             }
             let rs = self.var_str("RS");
+            let re = self.rs_regex(&rs)?;
+            let find = |t: &[u8], p: usize| re.as_deref().and_then(|r| Finder::new(r, t).find(p));
+            let finder: Option<RegexFinder> = re.is_some().then_some(&find);
             let rec = match &mut self.main {
-                Main::Stdin => self.io.stdin_reader().read_record(&rs, None)?,
-                Main::File(r) => r.read_record(&rs, None)?,
+                Main::Stdin => self.io.stdin_reader().read_record(&rs, finder)?,
+                Main::File(r) => r.read_record(&rs, finder)?,
                 Main::None => None,
             };
             match rec {
@@ -467,7 +483,8 @@ impl<'p> Interp<'p> {
     /// * `" "`: fields are runs of characters other than blank, tab and
     ///   newline;
     /// * `""`: one field per character;
-    /// * one other character: split at exactly that character;
+    /// * one other character: split at exactly that character (even one
+    ///   special in regexes, like `|`);
     /// * anything longer: a regular expression.
     ///
     /// In paragraph mode (RS = "") a newline also separates fields.
@@ -485,19 +502,60 @@ impl<'p> Interp<'p> {
         if fs.is_empty() {
             return Ok(s.iter().map(|&b| vec![b]).collect());
         }
-        if fs.len() == 1 && fs[0] != b'\\' {
+        if fs.len() == 1 {
             let c = fs[0];
             return Ok(s
                 .split(|&b| b == c || (paragraph && b == b'\n'))
                 .map(|p| p.to_vec())
                 .collect());
         }
-        self.regex_unsupported()
+        let re = if paragraph {
+            let mut src = b"\n|(".to_vec();
+            src.extend_from_slice(fs);
+            src.push(b')');
+            self.regex(&src)?
+        } else {
+            self.regex(fs)?
+        };
+        Ok(split_regex(&re, s))
     }
 
-    /// Phase 6 (the regex engine) is not written yet.
-    fn regex_unsupported<T>(&self) -> R<T> {
-        rt("regular expressions are not supported yet")
+    // ============================================================ regexes
+
+    /// The compiled regex for `src`, from the cache if possible.
+    fn regex(&mut self, src: &[u8]) -> R<Rc<Regex>> {
+        if let Some(re) = self.regexes.get(src) {
+            return Ok(re.clone());
+        }
+        let re = Rc::new(Regex::new(src)?);
+        if self.regexes.len() >= REGEX_CACHE_ENTRIES || self.regex_states + re.size() > NFA_LIMIT {
+            self.regexes.clear();
+            self.regex_states = 0;
+        }
+        self.regex_states += re.size();
+        self.regexes.insert(src.to_vec(), re.clone());
+        Ok(re)
+    }
+
+    /// The regex an operand stands for: a /literal/ as written, any other
+    /// expression's string value as a dynamic regex.
+    fn regex_operand(&mut self, e: &'p Expr) -> R<Rc<Regex>> {
+        match e {
+            Expr::Regex(src) => self.regex(src),
+            _ => {
+                let s = self.str_arg(e)?;
+                self.regex(&s)
+            }
+        }
+    }
+
+    /// The regex for a multi-byte RS (None for "" and single bytes).
+    fn rs_regex(&mut self, rs: &[u8]) -> R<Option<Rc<Regex>>> {
+        if rs.len() > 1 {
+            Ok(Some(self.regex(rs)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// `$i`.  A field past NF is the empty *string* (not uninitialized),
@@ -1008,7 +1066,21 @@ impl<'p> Interp<'p> {
     /// An expression as a truth value.
     fn cond(&mut self, e: &'p Expr) -> R<bool> {
         Ok(match e {
-            Expr::Regex(_) => self.regex_unsupported()?,
+            // A bare /re/ as a condition means `$0 ~ /re/`.
+            Expr::Regex(src) => {
+                let re = self.regex(src)?;
+                re.is_match(&self.record)
+            }
+            Expr::Match {
+                negate,
+                left,
+                regex,
+            } => {
+                // The regex is evaluated first, as in pyawk.
+                let re = self.regex_operand(regex)?;
+                let text = self.str_arg(left)?;
+                re.is_match(&text) != *negate
+            }
             Expr::Compare(op, l, r) => self.compare(*op, l, r)?,
             Expr::And(l, r) => self.cond(l)? && self.cond(r)?,
             Expr::Or(l, r) => self.cond(l)? || self.cond(r)?,
@@ -1046,6 +1118,7 @@ impl<'p> Interp<'p> {
             Expr::Num(n) => Value::Num(*n),
             Expr::Str(s) => Value::str(s),
             Expr::Regex(_)
+            | Expr::Match { .. }
             | Expr::Compare(..)
             | Expr::And(..)
             | Expr::Or(..)
@@ -1091,7 +1164,6 @@ impl<'p> Interp<'p> {
                 let found = arr.borrow().contains(&key);
                 Self::bool_value(found)
             }
-            Expr::Match { .. } => return self.regex_unsupported(),
             Expr::Concat(l, r) => {
                 let a = self.eval(l)?;
                 let a = self.to_str(&a);
@@ -1229,13 +1301,17 @@ impl<'p> Interp<'p> {
                 if let Some(t) = target {
                     place = Some(self.resolve_target(t)?);
                 }
+                let re = self.rs_regex(&rs)?;
+                let find =
+                    |t: &[u8], p: usize| re.as_deref().and_then(|r| Finder::new(r, t).find(p));
+                let finder: Option<RegexFinder> = re.is_some().then_some(&find);
                 let got = if kind == GetlineKind::File {
                     match self.io.input_file(&name) {
                         None => return Ok(Value::Num(-1.0)),
-                        Some(reader) => reader.read_record(&rs, None)?,
+                        Some(reader) => reader.read_record(&rs, finder)?,
                     }
                 } else {
-                    self.io.input_cmd(&name)?.read_record(&rs, None)?
+                    self.io.input_cmd(&name)?.read_record(&rs, finder)?
                 };
                 match got {
                     None => return Ok(Value::Num(0.0)),
@@ -1327,7 +1403,11 @@ impl<'p> Interp<'p> {
                 let arr = self.array(name)?;
                 let text = self.to_str(&s);
                 let pieces = match args.get(2) {
-                    Some(Expr::Regex(_)) => return self.regex_unsupported(),
+                    // A /literal/ is always a regex, even one byte long.
+                    Some(Expr::Regex(src)) => {
+                        let re = self.regex(src)?;
+                        split_regex(&re, &text)
+                    }
                     Some(e) => {
                         let fs = self.str_arg(e)?;
                         self.split_with_fs(&text, &fs, false)?
@@ -1344,7 +1424,52 @@ impl<'p> Interp<'p> {
                 }
                 num(pieces.len() as f64)
             }
-            Sub | Gsub | Match => self.regex_unsupported(),
+            Match => {
+                Self::arity(b, args, 2, 2)?;
+                let text = self.str_arg(&args[0])?;
+                let re = self.regex_operand(&args[1])?;
+                let (start, length) = match re.find_at(&text, 0) {
+                    Some((s, e)) => ((s + 1) as f64, (e - s) as f64),
+                    None => (0.0, -1.0),
+                };
+                self.set_global("RSTART", Value::Num(start))?;
+                self.set_global("RLENGTH", Value::Num(length))?;
+                num(start)
+            }
+            Sub | Gsub => {
+                Self::arity(b, args, 2, 3)?;
+                let re = self.regex_operand(&args[0])?;
+                let repl = self.str_arg(&args[1])?;
+                let global = b == Gsub;
+                match args.get(2) {
+                    // The default target is $0.
+                    None => {
+                        let text = self.record.clone();
+                        let (out, n) = substitute(&re, &repl, &text, global);
+                        if n > 0 {
+                            self.set_field(0, Value::Str(Rc::from(out)))?;
+                        }
+                        num(n as f64)
+                    }
+                    // An lvalue is resolved once (`arr[i++]` steps i once)
+                    // and only assigned if something was replaced.
+                    Some(t @ (Expr::Var(_) | Expr::Index(..) | Expr::Field(_))) => {
+                        let place = self.resolve_target(t)?;
+                        let old = self.get_place(&place)?;
+                        let text = self.to_str(&old);
+                        let (out, n) = substitute(&re, &repl, &text, global);
+                        if n > 0 {
+                            self.set_place(&place, Value::Str(Rc::from(out)))?;
+                        }
+                        num(n as f64)
+                    }
+                    // Any other target: computed, and the result dropped.
+                    Some(e) => {
+                        let text = self.str_arg(e)?;
+                        num(substitute(&re, &repl, &text, global).1 as f64)
+                    }
+                }
+            }
             Sprintf => {
                 if args.is_empty() {
                     return rt("sprintf: no format");

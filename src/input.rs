@@ -163,16 +163,24 @@ impl RecordReader {
     }
 
     /// Regex RS: as pyawk does, read everything first (a match could
-    /// otherwise be cut short at a chunk boundary).
+    /// otherwise be cut short at a chunk boundary).  Empty matches do not
+    /// separate records.
     fn read_regex(&mut self, find: RegexFinder) -> Result<Option<Vec<u8>>, Error> {
         while self.fill()? {}
         if self.start >= self.buf.len() {
             return Ok(None);
         }
-        match find(&self.buf, self.start) {
-            Some((s, e)) => Ok(Some(self.take(s, e - s))),
-            None => Ok(self.rest()),
+        let mut pos = self.start;
+        while let Some((s, e)) = find(&self.buf, pos) {
+            if e > s {
+                return Ok(Some(self.take(s, e - s)));
+            }
+            pos = s + 1;
+            if pos > self.buf.len() {
+                break;
+            }
         }
+        Ok(self.rest())
     }
 }
 
@@ -192,6 +200,22 @@ mod tests {
             out.push(String::from_utf8(rec).unwrap());
         }
         out
+    }
+
+    #[test]
+    fn regex_records_skip_empty_matches() {
+        // A finder for "x*": empty matches everywhere, real ones at x runs.
+        let find = |t: &[u8], p: usize| -> Option<(usize, usize)> {
+            let s = p;
+            let e = t[s..].iter().take_while(|&&b| b == b'x').count() + s;
+            Some((s, e))
+        };
+        let mut r = reader("axxbxc");
+        let mut got = Vec::new();
+        while let Some(rec) = r.read_record(b"x*", Some(&find)).unwrap() {
+            got.push(String::from_utf8(rec).unwrap());
+        }
+        assert_eq!(got, ["a", "b", "c"]);
     }
 
     #[test]
