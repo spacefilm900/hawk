@@ -64,3 +64,17 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
   majority; `gawk/getline.awk` (`cmd | getline x + 1`) is accepted by all
   three references but rejected by pyawk v1.0 and so by hawk (the case is
   skipped: the references disagree on its output). Corpus unchanged.
+* Phase 3 (and most of 4 and 7, since they fell out of the same code):
+  `value.rs` (values, strnum, CONVFMT/OFMT conversion, `strtod`-style
+  parsing, comparison) with an interim `format.rs` printf (marked for
+  phase 5); `array.rs` (insertion-ordered arrays), `input.rs` (records for
+  every RS; regex RS waits for phase 6), `io.rs` (redirections, pipes,
+  close, system), `rand.rs` (CPython's MT19937, so `rand()` matches pyawk);
+  `interp.rs`, a tree-walking interpreter (DESIGN.md, "Execution model"):
+  variables and function cells, expressions, assignments, control flow,
+  `exit`, BEGIN/END, the main loop, ranges, fields and NF, getline (all
+  forms), every builtin except the regex ones; `cli.rs` with `-F -v -f --`.
+  `cmd | getline x + 1` now parses as gawk and mawk do (a deliberate
+  difference from pyawk v1.0). Everything still failing needs the regex
+  engine (phase 6): golden 79/99, onetrue 159/56/9, gawk 136/54/114,
+  corpus total 374/130/123; regex patterns unchanged at 37/533.

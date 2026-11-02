@@ -20,30 +20,31 @@ pyawk v1.0 are listed at the end.
 ## Pipeline
 
 ```text
-source bytes --lexer.rs--> Vec<Token> --parser.rs--> ast.rs --compile.rs--> closures --runtime.rs--> output
-                                                        value.rs, format.rs, regex/, builtins.rs, io.rs
+source bytes --lexer.rs--> Vec<Token> --parser.rs--> ast.rs --interp.rs--> output
+                                       value.rs, format.rs, array.rs, input.rs, io.rs, rand.rs, regex/
 ```
 
 | Module | Responsibility | Phase |
 |---|---|---|
-| `main.rs` | executable; calls `cli::main` | 0 |
-| `cli.rs` | options `-F -v -f --`, `--version`, exit status | 0 / 4 |
-| `error.rs` | `Error` type: syntax errors (with source line) and runtime errors | 1 |
+| `main.rs` | executable; reads the command line as bytes, calls `cli::main` | 0 |
+| `cli.rs` | options `-F -v -f --`, `--version`, `-h`; runs the interpreter on a big-stack thread; exit status | 0 / 4 |
+| `error.rs` | `Error` type: syntax errors (with source line), runtime errors, broken pipe | 1 |
 | `lexer.rs` | tokens, newline rules, regex-vs-division, string escapes, numbers | 1 |
 | `ast.rs` | expression and statement enums | 2 |
 | `parser.rs` | recursive descent, one function per precedence level | 2 |
-| `value.rs` | `Value` (number / string / strnum), conversions, comparison | 3 |
-| `format.rs` | C-compatible `printf` (`%d %i %o %x %X %u %c %s %e %E %f %F %g %G`), number to string, `strtod`-style parsing | 5 |
+| `value.rs` | `Value` (number / string / strnum / uninit), conversions, comparison | 3 |
+| `format.rs` | `printf` formatting; an interim version now, made glibc-exact in phase 5 | 3 / 5 |
+| `array.rs` | AWK arrays: insertion-ordered hash maps | 3 |
+| `interp.rs` | the tree-walking interpreter: variables, expressions, statements, functions, main loop, records and fields, builtins | 3–7 |
+| `input.rs` | record reading for every kind of `RS` | 4 |
+| `io.rs` | output redirections, pipes, `getline` sources, `close`, `system` | 3 / 7 |
+| `rand.rs` | `rand`/`srand`: CPython's Mersenne Twister, so numbers match pyawk | 7 |
 | `regex/` | ERE parser, then NFA, then lazy DFA, with leftmost-longest matching | 6 |
-| `compile.rs` | AST into closures (a tree of boxed functions) | 3 |
-| `runtime.rs` | variables and statements (3); main loop, records and fields (4); ranges (7) | 3–7 |
-| `builtins.rs` | builtin functions, including `sub`/`gsub` and `split` | 7 |
-| `io.rs` | output redirections, pipes, `getline` sources, `close`, `system` | 7 |
 
 The crate is a library (`src/lib.rs`) plus a thin binary (`src/main.rs`).
 Each module keeps its unit tests at the bottom, in `#[cfg(test)] mod tests`.
-That section is compiled only for `cargo test`. End-to-end behaviour is
-checked by the external corpus runners (see README).
+That section is compiled only for `cargo test`. `tests/run.rs` runs the `hawk` binary end to end, and the external corpus
+runners check the rest (see README).
 
 ## Bytes everywhere
 
@@ -70,11 +71,18 @@ is the one place that turns an `Error` into `hawk: ...` on stderr and exit
 status 2. The message wording follows pyawk: `syntax error at source line
 N: ...`.
 
-AWK's own control flow (`next`, `exit`, `return`, `break`, `continue`) is
-*not* an error. pyawk used Python exceptions for it. hawk's statement
-executor returns a small enum (`Flow::Normal`, `Flow::Next`,
-`Flow::Exit(n)`, ...) that each loop and call site inspects. That is
+AWK's own control flow (`next`, `return`, `break`, `continue`) is *not*
+an error. pyawk used Python exceptions for it. hawk's statement executor
+returns a small enum (`Flow::Normal`, `Flow::Break`, `Flow::Next`,
+`Flow::Return`, ...) that each loop, rule and call site inspects. That is
 explicit and costs nothing when nothing happens.
+
+`exit` is different: it can happen inside an expression (a function called
+from an expression may `exit`), so it travels on the error side of
+`Result`, together with runtime errors, as `Unwind::Exit` /
+`Unwind::Err(e)`. `?` carries it up to `Interp::run`, which runs the END
+actions after an `exit` in BEGIN or a rule and stops at once for an `exit`
+in END.
 
 ## Values (phase 3)
 
@@ -89,7 +97,9 @@ then copies a pointer and bumps a counter instead of duplicating the bytes.
 That matters because AWK copies values constantly (assignments, function
 arguments, fields). `Rc` is single-threaded, and hawk has one thread.
 
-Arrays are `HashMap<Rc<[u8]>, Value>`. Arrays are passed to functions by
+Arrays (`array.rs`) are hash maps that remember insertion order, because
+pyawk's `for (k in a)` visits keys in insertion order (Python dictionaries
+keep it) and hawk prints the same. Arrays are passed to functions by
 reference, and a variable can turn out to be an array only when a function
 uses it as one. So an array slot is `Rc<RefCell<Array>>`: shared
 ownership (`Rc`) of a value that may be changed through any of its owners
@@ -97,14 +107,36 @@ ownership (`Rc`) of a value that may be changed through any of its owners
 
 ## Execution model (phase 3)
 
-As in pyawk, the AST is compiled once into closures. A closure is a
-function value that captures the data it needs. In Rust each compiled
-expression is a `Box<dyn Fn(&mut Runtime) -> Result<Value, Error>>`, a
-heap-allocated function object called through a *trait object* (`dyn Fn`,
-"any type that can be called like this function"). Variables are resolved
-to slot numbers at compile time, so running the program never looks a
-name up in a hash table. If closures turn out to be slow in Rust, a small
-bytecode VM is the fallback, behind the same interface.
+pyawk compiles the AST into Python closures before running it, because
+walking a tree in Python is slow. hawk instead walks the tree directly
+(`interp.rs`): `exec(&Stmt)` runs a statement and `eval(&Expr)` computes a
+value, each a `match` over the node kinds. In Rust a tree walk is already
+fast, it is far simpler to read and to check against pyawk's semantics,
+and it keeps the borrow checker out of the way (closures that capture a
+mutable interpreter are awkward in Rust). Correctness comes first;
+performance is measured in phase 8, and the hot spots (global variable
+lookup by name, string constants allocated on each evaluation) can then be
+resolved to slots or cached at load time without changing the interface.
+
+* **Variables.** Globals live in a hash map from name to
+  `Var::Scalar(Value)` or `Var::Array(ArrayRef)`; a missing name is still
+  untyped. Function parameters live in the current `Frame` as `Cell`s; an
+  untyped parameter remembers (`Link`) which caller variable it came from,
+  so that if the function uses it as an array the caller's variable becomes
+  that same array (pyawk's binder rules, ported one-to-one).
+* **Evaluation order** follows pyawk: an assignment resolves its target
+  (array and subscript, or field number) before evaluating the right-hand
+  side, and a getline target is resolved before reading.
+* **Fields** are split lazily, the first time a field or NF is used, with
+  the FS that was current when the record was read.
+* **Output** to stdout goes through a 64 KiB buffer, flushed before running
+  a command, at exit, and after every write when stdout is a terminal.
+* **Recursion.** The interpreter recurses on the native stack, so `cli.rs`
+  runs it on a thread with a 1 GiB stack (reserved address space, not
+  memory). Each user function call compares the stack position with the
+  start of the run and stops with pyawk's "function call nesting too deep
+  (runaway recursion?)" before the stack runs out (about 300 000 levels in
+  a release build), instead of crashing.
 
 ## Regex (phase 6)
 
@@ -120,6 +152,11 @@ state limit. The public interface is small (`Regex::new`, `is_match`,
 `find_at`) so the rest of the interpreter does not depend on the internals.
 
 ## printf and numbers (phase 5)
+
+Until phase 5, `format.rs` holds an *interim* formatter, clearly marked as
+such in its comments: it uses Rust's own float formatting (which is exact
+and rounds ties to even, as glibc does) and covers the common
+conversions. Phase 5 replaces or audits it against a C `printf` table.
 
 Rust's `format!` is not C's `printf`. hawk has a hand-written formatter
 that reproduces glibc output for the conversions AWK uses, including
@@ -166,3 +203,15 @@ once hawk has found that prefix.
   string literal continued with backslash-newline carries the line it
   *starts* on (pyawk used the line it ended on); this only affects which
   line a later error message names.
+* **`cmd | getline` result in arithmetic.** `"cmd" | getline x + 1` is
+  `("cmd" | getline x) + 1` in hawk, as in gawk and mawk; the same holds for
+  `- * / % ^`. pyawk v1.0 rejects it as a syntax error, and onetrue-awk
+  reads it as a concatenation with `+1`. hawk follows the reference
+  majority (`gawk/getline.awk` in the corpus; `tools/ast_check.py` lists it
+  as a deliberate difference).
+* **ASCII-only names.** `-v name=value`, `name=value` operands and program
+  identifiers accept only ASCII letters, digits and `_`, as POSIX
+  specifies. pyawk v1.0 used Python's `str.isidentifier()`, which also
+  accepts non-ASCII letters for `-v`.
+* **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
+  pyawk v1.0 used Python's Unicode case mapping.
