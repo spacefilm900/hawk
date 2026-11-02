@@ -9,14 +9,21 @@
 //!
 //! Like pyawk, the number of DFA states is capped ([`DFA_LIMIT`]); when the
 //! cap is hit the cache is thrown away and rebuilt as needed, which keeps
-//! memory bounded while each step stays linear in the NFA size.
+//! memory bounded while each step stays linear in the NFA size.  A state of
+//! a big regex can hold many NFA positions, so the total size of the
+//! states' position lists is capped too ([`KERNEL_LIMIT`]).
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::nfa::{Inst, Nfa};
 
 /// Most DFA states kept at once.
 pub const DFA_LIMIT: usize = 10_000;
+
+/// Most NFA positions kept in all the cached states' kernels at once (4 MiB
+/// of `u32`s).
+pub const KERNEL_LIMIT: usize = 1 << 20;
 
 /// A state id.  `UNKNOWN` marks a transition not computed yet.
 pub type StateId = u32;
@@ -32,7 +39,9 @@ pub const DEAD: u8 = 4;
 /// What identifies a DFA state: the NFA byte-instructions it is at, and
 /// whether it accepts now / at the end of the text.  Two kernels with the
 /// same closure behave identically, so keying on the closure merges them.
-type Key = (Box<[u32]>, u8);
+/// `Rc<[u32]>` is a shared, reference-counted list: the map's key and the
+/// state's entry in `chars` are one allocation, not two copies.
+type Key = (Rc<[u32]>, u8);
 
 pub struct Dfa {
     nfa: Nfa,
@@ -45,7 +54,9 @@ pub struct Dfa {
     /// One representative byte per class.
     reps: Vec<u8>,
     /// Per state: its NFA byte-instructions and flags.
-    chars: Vec<Box<[u32]>>,
+    chars: Vec<Rc<[u32]>>,
+    /// The total length of the lists in `chars` (see KERNEL_LIMIT).
+    stored: usize,
     pub flags: Vec<u8>,
     /// Transitions: state * nclasses + class -> state (or UNKNOWN).
     pub trans: Vec<StateId>,
@@ -90,6 +101,7 @@ impl Dfa {
             nclasses: cls + 1,
             reps,
             chars: Vec::new(),
+            stored: 0,
             flags: Vec::new(),
             trans: Vec::new(),
             map: HashMap::new(),
@@ -207,15 +219,20 @@ impl Dfa {
         if chars.is_empty() && !accept_end {
             flags |= DEAD;
         }
-        let key: Key = (chars.into_boxed_slice(), flags);
+        let key: Key = (Rc::from(chars), flags);
         if let Some(&id) = self.map.get(&key) {
             return id;
         }
-        if self.chars.len() >= DFA_LIMIT {
+        // Full, by count or by size: start afresh.  (A single state bigger
+        // than the limit is still kept, alone.)
+        if self.chars.len() >= DFA_LIMIT || self.stored + key.0.len() > KERNEL_LIMIT {
             self.flush();
         }
         let id = self.chars.len() as StateId;
-        self.chars.push(key.0.clone());
+        self.stored += key.0.len();
+        // `Rc::clone` copies the pointer and bumps the count; the list
+        // itself is shared.
+        self.chars.push(Rc::clone(&key.0));
         self.flags.push(flags);
         self.trans
             .extend(std::iter::repeat_n(UNKNOWN, self.nclasses));
@@ -230,6 +247,7 @@ impl Dfa {
 
     fn flush(&mut self) {
         self.chars.clear();
+        self.stored = 0;
         self.flags.clear();
         self.trans.clear();
         self.map.clear();
@@ -259,5 +277,12 @@ impl Dfa {
     #[cfg(test)]
     pub fn num_states(&self) -> usize {
         self.chars.len()
+    }
+
+    /// How many NFA positions the cached states hold in all.
+    #[cfg(test)]
+    pub fn stored(&self) -> usize {
+        debug_assert_eq!(self.stored, self.chars.iter().map(|c| c.len()).sum());
+        self.stored
     }
 }

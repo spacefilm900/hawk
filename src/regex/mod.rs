@@ -432,4 +432,22 @@ mod tests {
         assert!(r.is_match(&text));
         assert!(r.scan.borrow().num_states() <= dfa::DFA_LIMIT);
     }
+
+    #[test]
+    fn dfa_memory_is_bounded_when_states_are_big() {
+        // Each DFA state of this regex holds hundreds of NFA positions, so
+        // 9,000 states (under DFA_LIMIT) would take millions of entries; the
+        // cache must be flushed on its total size as well.
+        let r = re("(a|b)*a(a|b){600}c");
+        let mut text = Vec::new();
+        let mut x: u32 = 12345;
+        for _ in 0..9_000 {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            text.push(if x >> 16 & 1 == 0 { b'a' } else { b'b' });
+        }
+        // (There is no `c`, so the whole text is scanned.)
+        assert!(!r.is_match(&text));
+        assert!(r.scan.borrow().stored() <= dfa::KERNEL_LIMIT);
+        assert!(r.scan.borrow().flushes > 0);
+    }
 }

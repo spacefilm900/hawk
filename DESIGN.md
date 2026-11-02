@@ -173,8 +173,11 @@ and limits):
   without consuming a byte; states and transitions are built only when a
   byte is first seen in that state. Bytes the regex cannot tell apart share
   one transition column (byte classes). When a DFA grows past `DFA_LIMIT` =
-  10,000 states its cache is flushed and rebuilt on demand, so memory stays
-  bounded while the run time stays linear.
+  10,000 states, or when its states together hold more than `KERNEL_LIMIT` =
+  2^20 NFA positions (4 MiB; a big regex can have states of thousands of
+  positions each), its cache is flushed and rebuilt on demand, so memory
+  stays bounded while the run time stays linear. Each state's position list
+  is stored once, shared between the state table and the lookup map.
 * `mod.rs`: `Regex` (`new`, `is_match`, `find_at`, `size`) and `Finder`,
   a search over one text that remembers work between calls (gsub and split
   call it repeatedly). `find_at` returns the *leftmost-longest* match: the
