@@ -167,9 +167,13 @@ resolved to slots or cached at load time without changing the interface.
   with "syntax error ...: nesting too deep" instead of overflowing.
   Operator chains such as `1+1+...+1` are parsed by loops, but build a
   tree as deep as the chain is long, which the interpreter (and freeing
-  the tree) recurse over; so each link counts as a level too, until the
-  enclosing expression ends, and reserves 512 bytes of the parser's
-  stack budget for freeing and running the tree later. A chain of 4
+  the tree) recurse over; so each link counts as a level too, and
+  reserves 512 bytes of the parser's stack budget for freeing and running
+  the tree later. Links keep counting until the statement or pattern they
+  are in is finished, not just until their parentheses close: a chain
+  inside parentheses can start another chain, as in `((1+1)+1)+1`, and
+  the depths add up. (Separate chains in one statement are counted
+  together too, which is more than needed.) A chain of 4
   million terms used to overflow the 1 GiB stack; now chains past about
   20,000 terms are a syntax error (about 2,000 on a 2 MiB stack).
 * **Unknown stack size.** `cli.rs` tells the parser and the interpreter

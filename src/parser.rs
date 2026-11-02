@@ -250,10 +250,23 @@ impl Parser {
         if self.too_deep(used) {
             return Err(self.error("nesting too deep"));
         }
-        // Restore the depth rather than subtracting one: any chain links
-        // ([`Parser::link`]) made at this level are given back too.
         let (depth, links) = (self.depth, self.links);
         self.depth += 1;
+        let result = parse(self);
+        // Give this level back, but not the chain links ([`Parser::link`])
+        // made inside it: they are part of the tree `parse` returned, which
+        // may yet start a longer chain, as `(1 + 2)` does in `(1 + 2) + 3`.
+        // So they keep counting until the whole tree is done ([`Parser::tree`]).
+        // (Links only ever grow inside `parse`, so this cannot underflow.)
+        self.depth = depth + (self.links - links);
+        result
+    }
+
+    /// Parse one whole tree: a statement or a pattern.  Once it is done its
+    /// chain links no longer add to the depth of anything parsed after it,
+    /// so the depth and link counts go back to what they were.
+    fn tree<T>(&mut self, parse: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        let (depth, links) = (self.depth, self.links);
         let result = parse(self);
         (self.depth, self.links) = (depth, links);
         result
@@ -263,8 +276,10 @@ impl Parser {
     /// `(1 + 2) + 3`), which the operator loops build without recursing.
     /// The tree is still as deep as the chain is long, and the interpreter,
     /// like the code that frees the tree, recurses over that depth, so each
-    /// link counts towards the nesting limit until the enclosing
-    /// [`Parser::nested`] call returns.
+    /// link counts towards the nesting limit until the statement or pattern
+    /// it is in is finished (see [`Parser::nested`] and [`Parser::tree`]).
+    /// Separate chains in one statement, as in `f(1 + 2, 3 + 4)`, are
+    /// counted together: more than needed, but safe and simple.
     fn link(&mut self) -> Result<(), Error> {
         let used = self.stack_base.wrapping_sub(stack_position());
         if self.too_deep(used) {
@@ -557,7 +572,7 @@ impl Parser {
 
     /// One pattern expression; a parenthesised list `(/a/, /b/)` is not one.
     fn parse_pattern(&mut self) -> Result<Expr, Error> {
-        let e = self.parse_expr()?;
+        let e = self.tree(Self::parse_expr)?;
         self.check_no_group(&e)?;
         Ok(e)
     }
@@ -668,7 +683,7 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, Error> {
-        self.nested(Self::parse_statement_body)
+        self.tree(|p| p.nested(Self::parse_statement_body))
     }
 
     fn parse_statement_body(&mut self) -> Result<Stmt, Error> {
@@ -2112,6 +2127,42 @@ mod tests {
                     Err(e) => assert!(e.to_string().contains("nesting too deep"), "{e}"),
                 }
             }
+        };
+        std::thread::spawn(run).join().unwrap();
+    }
+
+    #[test]
+    fn chains_inside_parentheses_add_up() {
+        // `((1+1+...)+1+...)+1+...`: each level's chain starts from the
+        // tree the parentheses gave it, so the depths add up, and so must
+        // the links counted for them.  On a 2 MiB thread the whole tree
+        // must stay within what is safe to free (CodeRabbit review).
+        let run = || {
+            for (levels, links) in [(10, 100), (10, 1000), (5, 1500), (40, 1000), (100, 100)] {
+                let mut expr = String::from("1");
+                for _ in 0..levels {
+                    expr = format!("({expr}{})", "+1".repeat(links));
+                }
+                match parse(format!("BEGIN {{ x = {expr} }}").as_bytes()) {
+                    Ok(_) => assert!(levels * links <= 2_048, "{levels} x {links} accepted"),
+                    Err(e) => assert!(e.to_string().contains("nesting too deep"), "{e}"),
+                }
+            }
+        };
+        std::thread::spawn(run).join().unwrap();
+    }
+
+    #[test]
+    fn link_counts_start_afresh_for_each_statement_and_pattern() {
+        // Links are kept until the tree they belong to is finished: one
+        // statement, or one pattern.  Many statements with long chains
+        // are fine on a 2 MiB thread.
+        let run = || {
+            let chain = format!("x = 1{}", "+1".repeat(1_000));
+            let body = vec![chain; 50].join("; ");
+            let pattern = format!("$1 == 1{}", "+1".repeat(1_000));
+            let src = format!("BEGIN {{ {body} }}\n{pattern}\n{pattern}, {pattern} {{ {body} }}");
+            assert!(parse(src.as_bytes()).is_ok());
         };
         std::thread::spawn(run).join().unwrap();
     }
