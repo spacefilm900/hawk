@@ -11,8 +11,8 @@
 //! Array keys come from input data, so the lookup map uses the standard
 //! library's hasher, which is seeded randomly per map: input crafted so its
 //! keys collide (making every lookup slow) cannot be prepared in advance.
-//! The faster, unseeded `FxMap` below is kept for maps keyed by the
-//! program text itself (variable names).
+//! The faster, unseeded `FxMap` below is kept for variable names (chosen by
+//! the program text) and the small, capped regex cache.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};

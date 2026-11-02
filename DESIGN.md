@@ -107,8 +107,9 @@ ownership (`Rc`) of a value that may be changed through any of its owners
 Array keys come from the input, so the key index uses the standard
 library's randomly seeded hasher: input crafted so that every key lands in
 the same hash bucket (which made inserts quadratic with the unseeded FxHash
-used before) cannot be prepared in advance. FxHash is kept only for maps
-keyed by the program text (global variable names, the regex cache).
+used before) cannot be prepared in advance. FxHash is kept for global
+variable names (chosen by the program text) and the regex cache (at most
+512 entries, so collisions there cannot cost much).
 
 ## Execution model (phase 3)
 
