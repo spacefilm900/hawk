@@ -30,6 +30,16 @@ impl Error {
     }
 }
 
+impl Error {
+    /// A syntax error that belongs to no particular line.
+    pub fn syntax_no_line(msg: impl Into<String>) -> Error {
+        Error::Syntax {
+            msg: msg.into(),
+            line: None,
+        }
+    }
+}
+
 /// `Display` is the trait behind `{}` in format strings: the user-facing
 /// text.  The wording matches pyawk's messages.
 impl fmt::Display for Error {

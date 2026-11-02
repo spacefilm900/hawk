@@ -264,6 +264,94 @@ pub enum Tok {
     Assign, // =
 }
 
+impl Tok {
+    /// pyawk's name for this kind of token, used in "expected ..." messages:
+    /// `NAME`, `NUMBER`, a keyword itself, an operator's spelling.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Tok::Number(_) => "NUMBER",
+            Tok::Str(_) => "STRING",
+            Tok::Ere(_) => "ERE",
+            Tok::Name(_) => "NAME",
+            Tok::FuncName(_) => "FUNC_NAME",
+            Tok::Builtin(_) => "BUILTIN",
+            Tok::Newline => "NEWLINE",
+            Tok::Eof => "EOF",
+            Tok::Begin => "BEGIN",
+            Tok::End => "END",
+            Tok::Function => "function",
+            Tok::If => "if",
+            Tok::Else => "else",
+            Tok::While => "while",
+            Tok::For => "for",
+            Tok::Do => "do",
+            Tok::Break => "break",
+            Tok::Continue => "continue",
+            Tok::Next => "next",
+            Tok::Nextfile => "nextfile",
+            Tok::Exit => "exit",
+            Tok::Return => "return",
+            Tok::Delete => "delete",
+            Tok::In => "in",
+            Tok::Getline => "getline",
+            Tok::Print => "print",
+            Tok::Printf => "printf",
+            Tok::AddAssign => "+=",
+            Tok::SubAssign => "-=",
+            Tok::MulAssign => "*=",
+            Tok::DivAssign => "/=",
+            Tok::ModAssign => "%=",
+            Tok::PowAssign => "^=",
+            Tok::Eq => "==",
+            Tok::Le => "<=",
+            Tok::Ge => ">=",
+            Tok::Ne => "!=",
+            Tok::Incr => "++",
+            Tok::Decr => "--",
+            Tok::And => "&&",
+            Tok::Or => "||",
+            Tok::Append => ">>",
+            Tok::NoMatch => "!~",
+            Tok::LBrace => "{",
+            Tok::RBrace => "}",
+            Tok::LParen => "(",
+            Tok::RParen => ")",
+            Tok::LBracket => "[",
+            Tok::RBracket => "]",
+            Tok::Semicolon => ";",
+            Tok::Comma => ",",
+            Tok::Plus => "+",
+            Tok::Minus => "-",
+            Tok::Star => "*",
+            Tok::Slash => "/",
+            Tok::Percent => "%",
+            Tok::Caret => "^",
+            Tok::Not => "!",
+            Tok::Gt => ">",
+            Tok::Lt => "<",
+            Tok::Pipe => "|",
+            Tok::Question => "?",
+            Tok::Colon => ":",
+            Tok::Tilde => "~",
+            Tok::Dollar => "$",
+            Tok::Assign => "=",
+        }
+    }
+
+    /// The token's text as an error message shows it ("found ..."):
+    /// a name, a string's value, `newline`, an operator's spelling.
+    pub fn shown(&self) -> Vec<u8> {
+        match self {
+            Tok::Number(v) => format!("{v}").into_bytes(),
+            Tok::Str(s) | Tok::Ere(s) => s.clone(),
+            Tok::Name(n) | Tok::FuncName(n) => n.clone().into_bytes(),
+            Tok::Builtin(b) => b.name().as_bytes().to_vec(),
+            Tok::Newline => b"newline".to_vec(),
+            other => other.type_name().as_bytes().to_vec(),
+        }
+    }
+}
+
 /// A token plus the source line it started on (for error messages).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
