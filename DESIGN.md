@@ -161,6 +161,12 @@ resolved to slots or cached at load time without changing the interface.
   the tree) recurse over; so each link counts as a level too, until the
   enclosing expression ends. A chain of 4 million terms used to overflow
   the 1 GiB stack; now chains past about 20,000 terms are a syntax error.
+* **Unknown stack size.** `cli.rs` tells the parser and the interpreter
+  how big their stack is. Library callers of `parser::parse` (or an
+  interpreter `Config` with `stack_size` 0) do not, so both then assume
+  2 MiB, what Rust gives the threads it spawns, rather than the main
+  thread's usual 8 MiB: limits are then hit sooner, but never past the
+  end of the stack.
 
 ## Regex (phase 6)
 

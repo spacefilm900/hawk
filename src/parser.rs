@@ -59,14 +59,16 @@ pub fn parse(source: &[u8]) -> Result<Program, Error> {
     parse_with_stack(source, 0)
 }
 
-/// `parse`, on a thread whose stack is `stack_size` bytes (0: the usual
-/// 8 MiB).  The parser uses at most half of it, leaving the rest for the
-/// interpreter's own recursion over the deepest expressions.
+/// `parse`, on a thread whose stack is `stack_size` bytes (0: unknown, so
+/// assume 2 MiB, the smallest stack a thread usually has: Rust gives the
+/// threads it spawns 2 MiB, and the main thread usually has 8 MiB).  The
+/// parser uses at most half of it, leaving the rest for the interpreter's
+/// own recursion over the deepest expressions.
 pub fn parse_with_stack(source: &[u8], stack_size: usize) -> Result<Program, Error> {
     let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens);
     parser.stack_budget = match stack_size {
-        0 => 8 << 20,
+        0 => 2 << 20,
         n => n,
     } / 2;
     parser.parse_program()
@@ -2037,6 +2039,26 @@ mod tests {
                 .unwrap();
             assert_eq!(parsed, None);
         }
+    }
+
+    #[test]
+    fn parse_is_safe_on_a_default_thread() {
+        // `parse` is not told how big its stack is, so it must not assume
+        // more than a thread gets by default: 2 MiB for threads Rust
+        // spawns (the main thread usually has 8 MiB).
+        let src = format!(
+            "BEGIN {{ x = {}1{} }}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let msg = std::thread::spawn(move || parse(src.as_bytes()).err().map(|e| e.to_string()))
+            .join()
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("syntax error at source line 1: nesting too deep"),
+            "{msg}"
+        );
     }
 
     #[test]

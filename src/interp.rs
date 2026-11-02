@@ -145,8 +145,9 @@ pub struct Config {
     pub operands: Vec<Vec<u8>>,
     /// `-v var=value` and `-F fs` (as `FS=fs`), applied before BEGIN.
     pub assignments: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Size of the stack the interpreter runs on (0: assume 8 MiB, the
-    /// usual main-thread size).  Recursion stops with an error, rather
+    /// Size of the stack the interpreter runs on (0: unknown, so assume
+    /// 2 MiB, the smallest a thread usually has: Rust gives the threads it
+    /// spawns 2 MiB, and the main thread usually has 8 MiB).  Recursion stops with an error, rather
     /// than a crash, before it runs out.
     pub stack_size: usize,
 }
@@ -231,8 +232,10 @@ impl<'p> Interp<'p> {
             regexes: FxMap::default(),
             regex_states: 0,
             stack_base: stack_position(),
+            // 0: the stack size is unknown, so assume 2 MiB, what Rust
+            // gives the threads it spawns (see `Config::stack_size`).
             stack_budget: match config.stack_size {
-                0 => 8 << 20,
+                0 => 2 << 20,
                 n => n,
             }
             .saturating_sub(STACK_MARGIN)
@@ -1633,6 +1636,22 @@ mod tests {
         assert_eq!(assignment_operand(b"=1"), None);
         assert_eq!(assignment_operand(b"a.txt"), None);
         assert_eq!(assignment_operand(b"./x=1"), None);
+    }
+
+    #[test]
+    fn runaway_recursion_is_safe_on_a_default_thread() {
+        // With `stack_size` 0 the interpreter does not know its stack, so
+        // it must assume no more than the 2 MiB a spawned thread gets.
+        let src = b"function f(n) { return f(n + 1) } BEGIN { f(0) }";
+        let msg = std::thread::spawn(move || {
+            let prog = crate::parser::parse(src).unwrap();
+            let mut interp = Interp::new(&prog, &Config::default()).unwrap();
+            interp.run().err().map(|e| e.to_string())
+        })
+        .join()
+        .unwrap()
+        .unwrap_or_default();
+        assert!(msg.contains("function call nesting too deep"), "{msg}");
     }
 
     #[test]
