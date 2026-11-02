@@ -587,6 +587,9 @@ impl Lexer<'_> {
     /// except that `\/` becomes `/`.  A `/` inside a bracket expression such
     /// as `[/]` does not end the regex, so we track whether we are in one.
     fn regex(&mut self) -> Result<(), Error> {
+        // The token belongs to the line the regex starts on, even if a
+        // backslash-newline continues it onto the next.
+        let start_line = self.line;
         let src = self.src;
         let mut i = self.pos + 1;
         let mut buf = Vec::new();
@@ -619,6 +622,7 @@ impl Lexer<'_> {
                     buf.push(b'/');
                 } else if d == b'\n' {
                     buf.extend_from_slice(&[c, d]);
+                    self.line += 1;
                     line_end = find_line_end(i + 2);
                     next_close = [None; 3];
                 } else {
@@ -679,7 +683,7 @@ impl Lexer<'_> {
             i += 1;
         }
         self.pos = i + 1;
-        self.emit(Tok::Ere(buf), self.line);
+        self.emit(Tok::Ere(buf), start_line);
         Ok(())
     }
 
@@ -915,6 +919,14 @@ mod tests {
         let lines: Vec<u32> = t.iter().map(|t| t.line).collect();
         // a NL b c NL "st" d EOF
         assert_eq!(lines, [1, 1, 3, 4, 4, 5, 6, 6]);
+        // A regex continued with backslash-newline counts that line too;
+        // the regex itself belongs to the line it starts on.
+        let t = tokenize(b"a\n/x\\\ny/ d").unwrap();
+        let lines: Vec<u32> = t.iter().map(|t| t.line).collect();
+        // a NL /x\ny/ d EOF
+        assert_eq!(lines, [1, 1, 2, 3, 3]);
+        let e = tokenize(b"\n/x\\\ny").unwrap_err().to_string();
+        assert!(e.starts_with("syntax error at source line 3"), "{e}");
     }
 
     #[test]

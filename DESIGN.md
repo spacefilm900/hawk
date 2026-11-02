@@ -290,7 +290,9 @@ once hawk has found that prefix.
   `unexpected character '\xc3'` rather than as a decoded character. A
   string literal continued with backslash-newline carries the line it
   *starts* on (pyawk used the line it ended on); this only affects which
-  line a later error message names.
+  line a later error message names. A regex literal continued the same
+  way also counts the continued line, which pyawk v1.0 forgot, so errors
+  after it name the right line (as onetrue-awk does).
 * **`cmd | getline` result in arithmetic.** `"cmd" | getline x + 1` is
   `("cmd" | getline x) + 1` in hawk, as in gawk and mawk; the same holds for
   `- * / % ^`. pyawk v1.0 rejects it as a syntax error, and onetrue-awk
