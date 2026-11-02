@@ -22,7 +22,9 @@ const USAGE: &str = "usage: hawk [-F fs][-v var=value][-f progfile | 'prog'][fil
 /// functions recurse in the interpreter too; the main thread's default
 /// (often 8 MiB) would overflow long before AWK's own depth limit.  The
 /// memory is only reserved, not used, until the recursion needs it.
-const STACK_SIZE: usize = 1 << 30;
+/// If even reserving it fails (under `ulimit -v`, say), smaller sizes are
+/// tried in turn, and the interpreter's recursion limit shrinks to match.
+const STACK_SIZES: [usize; 4] = [1 << 30, 256 << 20, 64 << 20, 16 << 20];
 
 /// What the options asked for.
 struct Parsed {
@@ -136,7 +138,6 @@ fn parse_args(args: &[Vec<u8>]) -> Result<Parsed, Option<String>> {
         }
     };
     config.operands = args[i..].to_vec();
-    config.stack_size = STACK_SIZE;
     Ok(Parsed { source, config })
 }
 
@@ -154,17 +155,51 @@ pub fn main(args: Vec<Vec<u8>>) -> i32 {
             return 2;
         }
     };
-    // Run on a thread with a big stack (see STACK_SIZE).  `move` hands the
-    // parsed program over to the new thread; `join` waits for its result.
-    let worker = std::thread::Builder::new()
-        .stack_size(STACK_SIZE)
-        .spawn(move || run(parsed));
-    match worker.map(|handle| handle.join()) {
-        Ok(Ok(status)) => status,
-        _ => {
-            eprintln!("hawk: internal error");
-            2
+    on_big_stack(move |stack_size| {
+        let mut parsed = parsed;
+        parsed.config.stack_size = stack_size;
+        run(parsed)
+    })
+}
+
+/// Run `job` on a thread with the biggest stack in STACK_SIZES that can be
+/// reserved, passing it that size; if no thread can be started at all, run
+/// it on this thread, passing 0 ("the usual size").
+///
+/// `F: FnOnce(usize) -> i32 + Send + 'static` says what `job` must be: a
+/// function called once with a size, returning the exit status, that may
+/// move to another thread (`Send`) and borrows nothing from this one
+/// (`'static`).
+fn on_big_stack<F: FnOnce(usize) -> i32 + Send + 'static>(job: F) -> i32 {
+    // `spawn` consumes the function it is given even when it fails, so the
+    // job sits in a shared slot (`Arc` = shared ownership across threads,
+    // `Mutex` = safe access from either) that each attempt can take it from.
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+    for size in STACK_SIZES {
+        let mine = std::sync::Arc::clone(&slot);
+        let worker = std::thread::Builder::new()
+            .stack_size(size)
+            .spawn(move || mine.lock().unwrap().take().map(|job| job(size)));
+        match worker {
+            // The thread ran: `join` waits for it.  `Ok(Some(status))` is
+            // its exit status; `Err` means it panicked (the panic message
+            // has already been printed).
+            Ok(handle) => {
+                return match handle.join() {
+                    Ok(Some(status)) => status,
+                    _ => {
+                        eprintln!("hawk: internal error");
+                        2
+                    }
+                };
+            }
+            Err(_) => {}
         }
+    }
+    match slot.lock().unwrap().take() {
+        Some(job) => job(0),
+        // Unreachable: a thread that took the job returned above.
+        None => 2,
     }
 }
 
@@ -203,7 +238,8 @@ fn dump_ast(args: &[Vec<u8>]) -> i32 {
             return 2;
         }
     };
-    match crate::parser::parse(&parsed.source) {
+    // The parser recurses too, so it also gets the big stack.
+    on_big_stack(move |_| match crate::parser::parse(&parsed.source) {
         Ok(program) => {
             println!("{}", crate::ast::dump_program(&program));
             0
@@ -212,5 +248,5 @@ fn dump_ast(args: &[Vec<u8>]) -> i32 {
             eprintln!("hawk: {e}");
             2
         }
-    }
+    })
 }

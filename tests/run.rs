@@ -265,3 +265,22 @@ fn failed_writes_to_files_are_reported() {
     );
     assert_eq!((o.as_str(), e.as_str(), rc), ("", msg, 2));
 }
+
+#[test]
+fn runs_when_the_big_stack_cannot_be_reserved() {
+    // Under a small address-space limit the 1 GiB interpreter stack cannot
+    // be reserved; hawk must fall back to a smaller one, not give up.
+    let script = format!(
+        "ulimit -v 600000 && exec '{}' 'BEGIN {{ print 1 }}'",
+        env!("CARGO_BIN_EXE_hawk")
+    );
+    let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+    let (o, e) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        (o.as_ref(), e.as_ref(), out.status.code()),
+        ("1\n", "", Some(0))
+    );
+}
