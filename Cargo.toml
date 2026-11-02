@@ -1,0 +1,18 @@
+[package]
+name = "hawk"
+version = "0.1.0"
+edition = "2024"
+description = "Haviland Awk: a POSIX AWK interpreter in Rust (a port of pyawk)"
+license = "MIT"
+publish = false
+
+# hawk deliberately uses nothing but Rust's standard library.
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+# Slower to build, a little faster to run; the release binary is what the
+# corpus runners test.
+lto = true
+codegen-units = 1

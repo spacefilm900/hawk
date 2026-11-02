@@ -1,0 +1,6 @@
+# Used by rustup (if installed): the stable toolchain plus the formatter and
+# linter that tools/regress.sh runs.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
