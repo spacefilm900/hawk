@@ -166,6 +166,13 @@ fn output_redirection_and_pipes() {
 }
 
 #[test]
+fn getline_result_in_arithmetic() {
+    // (cmd | getline x) + 1, as gawk and mawk; pyawk v1.0 rejects it.
+    let prog = "BEGIN { y = \"echo 7\" | getline z + 1; print y, z }";
+    assert_eq!(out(&[prog], ""), "2 7\n");
+}
+
+#[test]
 fn bare_printf_prints_nothing() {
     assert_eq!(out(&["BEGIN { printf; print \"X\" }"], ""), "X\n");
 }

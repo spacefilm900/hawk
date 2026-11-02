@@ -957,6 +957,16 @@ impl Parser {
                 target: target.map(bx),
                 source: Some(bx(left)),
             };
+            // The result is an ordinary operand for the arithmetic that
+            // follows: `cmd | getline x + 1` is `(cmd | getline x) + 1`, as
+            // in gawk and mawk (onetrue-awk differs).  pyawk v1.0 rejects
+            // this; hawk follows the majority.  See DESIGN.md.
+            if self.accept(&Tok::Caret) {
+                let exponent = self.parse_power_rhs()?;
+                left = Expr::Binary(BinOp::Pow, bx(left), bx(exponent));
+            }
+            left = self.multiplicative_rest(left)?;
+            left = self.additive_rest(left)?;
             // `cmd | getline x y` is `(cmd | getline x) y`: the result may be
             // concatenated with what follows (all three references).
             while starts_concat(self.tok()) {
@@ -981,7 +991,12 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> Result<Expr, Error> {
-        let mut left = self.parse_multiplicative()?;
+        let left = self.parse_multiplicative()?;
+        self.additive_rest(left)
+    }
+
+    /// The `+ x - y ...` that may follow an already parsed left operand.
+    fn additive_rest(&mut self, mut left: Expr) -> Result<Expr, Error> {
         loop {
             let op = match self.tok() {
                 Tok::Plus => BinOp::Add,
@@ -995,7 +1010,12 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, Error> {
-        let mut left = self.parse_unary()?;
+        let left = self.parse_unary()?;
+        self.multiplicative_rest(left)
+    }
+
+    /// The `* x / y ...` that may follow an already parsed left operand.
+    fn multiplicative_rest(&mut self, mut left: Expr) -> Result<Expr, Error> {
         loop {
             let op = match self.tok() {
                 Tok::Star => BinOp::Mul,
@@ -1484,7 +1504,37 @@ mod tests {
         );
         // cmd | getline x y is (cmd | getline x) y
         let first = gl(GetlineKind::Cmd, Some(v("x")), Some(v("c")));
-        assert_eq!(expr("c | getline x y"), Expr::Concat(b(first), b(v("y"))));
+        assert_eq!(
+            expr("c | getline x y"),
+            Expr::Concat(b(first.clone()), b(v("y")))
+        );
+        // cmd | getline x + 1 is (cmd | getline x) + 1, as gawk and mawk
+        // parse it (a deliberate difference from pyawk v1.0, which rejects it).
+        let one = || b(Expr::Num(1.0));
+        assert_eq!(
+            expr("c | getline x + 1"),
+            Expr::Binary(BinOp::Add, b(first.clone()), one())
+        );
+        assert_eq!(
+            expr("c | getline x * 2 - 1"),
+            Expr::Binary(
+                BinOp::Sub,
+                b(Expr::Binary(
+                    BinOp::Mul,
+                    b(first.clone()),
+                    b(Expr::Num(2.0))
+                )),
+                one()
+            )
+        );
+        assert_eq!(
+            expr("c | getline x ^ 2"),
+            Expr::Binary(BinOp::Pow, b(first.clone()), b(Expr::Num(2.0)))
+        );
+        assert_eq!(
+            expr("c | getline x + 1 \"a\""),
+            Expr::Concat(b(Expr::Binary(BinOp::Add, b(first), one())), b(s("a")))
+        );
         // "a" "b" | getline: the command is the whole concatenation.
         let cmd = Expr::Concat(b(s("a")), b(s("b")));
         assert_eq!(

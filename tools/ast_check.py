@@ -6,6 +6,9 @@ pyawk v1.0's parser (through tools/ast_dump.py) and compare:
 * both parse and the trees are identical: ``same``;
 * both reject the program: ``both-reject`` (the message is compared too,
   and a different message is listed but not counted as a failure);
+* a program listed in ``DELIBERATE`` (hawk differs from pyawk v1.0 on
+  purpose, see DESIGN.md) must be accepted by hawk and rejected by pyawk:
+  ``deliberate``;
 * anything else is a mismatch, printed and counted; exit status 1.
 
 pyawk v1.0 is taken from the pyawk repository's ``v1.0`` tag with
@@ -26,6 +29,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from corpus import CORPUS, DEFAULT_HAWK, REPO
+
+
+# Programs where hawk's parse differs from pyawk v1.0 on purpose (hawk
+# accepts, pyawk rejects).  Each entry names its DESIGN.md section.
+DELIBERATE = {
+    # "cmd | getline x + 1": DESIGN.md, "getline result in arithmetic".
+    "gawk/getline.awk",
+}
 
 
 def extract_pyawk(repo: Path, dest: Path) -> None:
@@ -75,11 +86,13 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(compare, programs))
 
-    same = both_reject = msg_diff = 0
+    same = both_reject = msg_diff = deliberate = 0
     mismatches = []
     for prog, h, p in results:
         name = prog.relative_to(CORPUS)
-        if h == p:
+        if str(name) in DELIBERATE and not h.startswith("ERROR") and p.startswith("ERROR"):
+            deliberate += 1
+        elif h == p:
             if h.startswith("ERROR"):
                 both_reject += 1
             else:
@@ -94,7 +107,8 @@ def main() -> int:
             print(f"MISMATCH {name}\n  hawk:  {h[:400]}\n  pyawk: {p[:400]}")
     print(
         f"{len(results)} programs: {same} same tree, {both_reject} rejected by both "
-        f"({msg_diff} with a different message), {len(mismatches)} mismatches"
+        f"({msg_diff} with a different message), {deliberate} deliberate differences, "
+        f"{len(mismatches)} mismatches"
     )
     return 1 if mismatches else 0
 
