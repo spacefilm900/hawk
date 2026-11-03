@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """A rough speed comparison of hawk against other awks.
 
-usage: tools/bench.py [--lines N] [--runs N] AWK...
+usage: tools/bench.py [--lines N] [--runs N] [--locale LOCALE] AWK...
 
 Generates a file of N lines (seeded, so every run is the same), runs a few
 typical programs with each awk, checks that they all print the same thing,
 and prints the best wall-clock time of each.  Not a rigorous benchmark:
 one machine, one file, best of a few runs.
+
+Every awk runs with LC_ALL=C (bytes) unless --locale names another locale,
+e.g. --locale C.UTF-8 to time UTF-8 (characters) mode.  The generated input
+is plain ASCII, so the outputs agree in either mode.
 """
 import argparse
 import os
@@ -29,6 +33,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lines", type=int, default=500_000)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--locale", default="C", help="LC_ALL for every awk (default C; try C.UTF-8)")
     ap.add_argument("awks", nargs="+")
     opts = ap.parse_args()
     rng = random.Random(1)
@@ -45,7 +50,8 @@ def main():
 
 
 def run(opts, data):
-    print(f"{opts.lines} lines; best of {opts.runs} runs, seconds")
+    print(f"{opts.lines} lines; best of {opts.runs} runs, seconds, LC_ALL={opts.locale}")
+    env = dict(os.environ, LC_ALL=opts.locale)
     print(f"{'program':20}" + "".join(f"{a.split('/')[-1]:>12}" for a in opts.awks))
     for name, args in PROGRAMS:
         row, outs = [], set()
@@ -53,7 +59,7 @@ def run(opts, data):
             best = None
             for _ in range(opts.runs):
                 t = time.perf_counter()
-                p = subprocess.run(awk.split() + args + [data], capture_output=True)
+                p = subprocess.run(awk.split() + args + [data], capture_output=True, env=env)
                 dt = time.perf_counter() - t
                 # A failed run is fast and meaningless: stop rather than
                 # print its time.

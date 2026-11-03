@@ -19,9 +19,10 @@ commit.
 | 7 | Arrays, builtins, functions, ranges, I/O | `in`, `delete`, `SUBSEP`, `for (k in a)`; `length substr index split sub gsub match sprintf tolower toupper sin cos atan2 exp log sqrt int rand srand system close fflush`; user functions (scalars by value, arrays by reference, untyped parameters that become arrays, recursion); range patterns; `getline` (all five forms); `print`/`printf` with `> >> \|`; `close()` status; `ARGV`/`ARGC` | the golden corpus 99/99, onetrue 215/215, gawk 190/190, as pyawk v1.0 |
 | 8 | v1.0 release | docs, a performance check against pyawk and mawk, tag `v1.0` | the user signs off |
 
-Later, after v1.0 and in pyawk v1.1's order: `nextfile`, `ENVIRON` and the
-full I/O audit, the POSIX parse-time errors, UTF-8 locale mode, collating
-symbols and equivalence classes, and the regex differential at 570/570.
+Later, after v1.0 and in pyawk v1.1's order (all done on `enhancements`,
+below): `nextfile`, `ENVIRON` and the full I/O audit, the POSIX parse-time
+errors, UTF-8 locale mode, collating symbols and equivalence classes, and
+the regex differential at 570/570.
 
 ## Baseline (phase 0, stub binary)
 
@@ -115,4 +116,12 @@ pyawk v1.1's extras, in four stages; `main` stays at v1.0.
   exit 2); SIGPIPE death; deep nesting uses pyawk's message. Corpus
   548/13/121 (golden `io` 18/18, `environ` 5/5); the 13 failures are all
   `utf8` (stage 4). `tests/io.rs` has 19 end-to-end I/O tests.
+* Stage 4, UTF-8 mode: the locale picks UTF-8 or C mode; string
+  builtins, `split`/`FS = ""` and `printf` count characters; Unicode
+  classes and case maps from gawk 5.4.1 (equal to pyawk's); regexes
+  match characters (code-point sets compiled to UTF-8 byte tries, invalid
+  bytes as U+DC80..DCFF); `%c` in C mode is the low byte. Corpus
+  561/0/121 (golden `utf8` 13/13), UTF-8 regex table 2152/0 and now a
+  hard gate, C table 13503/0, AST 654 same + 28 rejected by both, 0
+  pending. Benchmark: UTF-8 mode within noise of C mode.
 

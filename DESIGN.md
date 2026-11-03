@@ -62,8 +62,8 @@ messages. All AWK data uses `Vec<u8>` (an owned, growable byte buffer) or
 `&[u8]` (a borrowed view of bytes). That includes program text, string
 literals, regex sources, records, fields and values. Lowercasing,
 "is a digit" and so on are ASCII operations on bytes, as in the C locale.
-A UTF-8 mode, as in pyawk v1.1, can later sit on top of this as a
-character-counting layer.
+UTF-8 mode (stage 4 of the v1.1 port, below) sits on top of this as a
+character-counting layer: the data stays bytes.
 
 Octal escapes give a byte: `"\101"` is `A`. Values above `\377` wrap to
 8 bits, as in the C implementations.
@@ -261,11 +261,11 @@ matches do not end a record.
 
 **The UTF-8 seam.** The engine works on bytes. Everything that knows about
 characters is in `parse.rs`: `.`, bracket expressions and classes become
-`ByteSet`s there. A UTF-8 mode would change only the parser, turning a
+`ByteSet`s there. UTF-8 mode changes only the parser, which turns a
 character set into an alternation of byte sequences (the usual way to run
-UTF-8 through a byte automaton); the NFA, DFA and search would not change.
-`RSTART`/`RLENGTH` and `substr` would then convert byte offsets to
-character offsets at the interpreter boundary.
+UTF-8 through a byte automaton); the NFA, DFA and search did not change.
+`RSTART`/`RLENGTH` and `substr` convert byte offsets to character offsets
+at the interpreter boundary. See "UTF-8 (stage 4)" below.
 
 ## printf and numbers (phase 5)
 
@@ -350,7 +350,9 @@ once hawk has found that prefix.
 * **`%c` of 128 to 255** writes that single raw byte, as gawk does in the
   C locale (the user's decision, in keeping with hawk working on bytes).
   pyawk v1.0 wrote the Unicode character, UTF-8 encoded (two bytes).
-  Codes of 256 and up are still written as UTF-8, as pyawk does.
+  Since stage 4 of the v1.1 port, C mode writes the low byte of any code
+  (`%c` of 321 is `A`), as pyawk v1.1, gawk and mawk do; UTF-8 mode
+  writes the character as UTF-8 (see "UTF-8 (stage 4)").
 * **`%c` of a numeric string or an unset variable.** A field such as
   `65` is a numeric string, so `printf "%c", $1` writes `A`, and an unset
   variable is the number 0, so it writes a NUL byte. This is POSIX, and
@@ -395,8 +397,8 @@ once hawk has found that prefix.
   added to the environment (inherited `PYAWK_T_*` variables are dropped
   first); golden cases run in a temporary copy of their directory.
 * `tools/regex_check.py` also runs the UTF-8 record. The C table is now a
-  hard gate (any disagreeing line fails the run); the UTF-8 table counts
-  only regressions until hawk has a UTF-8 mode (`HARD_GATES`).
+  hard gate (any disagreeing line fails the run). The UTF-8 table counted
+  only regressions until stage 4; it is now a hard gate too (`HARD_GATES`).
 * `tools/ast_check.py` compares with pyawk **v1.1**'s parser. Programs it
   parses differently only because a stage is not done yet are listed in
   `PENDING` and reported, not failed. `tools/ast_dump.py` now decodes the
@@ -519,3 +521,78 @@ Unchanged and confirmed: getline's NR/FNR rules, `>` truncating once per
 name, the redirection-target and `cmd | getline` precedence rules,
 `"echo " "hi" | getline` running `echo hi`, and stdout not being flushed
 before every getline (mawk, gawk).
+
+### UTF-8 (stage 4)
+
+hawk now has pyawk v1.1's two locale modes. The data stays bytes in both;
+what changes is where the characters are.
+
+* **Mode.** The first of `LC_ALL`, `LC_CTYPE` and `LANG` that is set and
+  not empty decides: a name containing `UTF-8` or `utf8` (any case) is
+  UTF-8 mode, anything else (and nothing) is C mode, where a byte is a
+  character (`charset::locale_is_utf8`). Remember that the box and many
+  CI images set `LC_ALL=C.UTF-8`; the end-to-end tests pin `LC_ALL=C`
+  where they test bytes.
+* **Characters.** A valid UTF-8 sequence is one character. Any other
+  byte (stray continuation, truncated or overlong sequence, encoded
+  surrogate) is an *invalid byte*: one character of its own, never
+  changed, so any input is written back unchanged. `charset.rs` has the
+  helpers (`next`, `count`, `char_offsets`, `round_up`, ...).
+* **Builtins.** `length`, `substr`, `index`, `match`'s RSTART/RLENGTH,
+  `split(s, a, "")` and `FS = ""` count characters; `toupper`/`tolower`
+  map Unicode letters and leave invalid bytes alone; `printf` widths and
+  precisions of `%s`/`%c` count characters. `%c` of a number writes that
+  code point as UTF-8 (gawk's extended form above U+10FFFF, as pyawk);
+  `%c` of a string writes its first character. Byte offsets are turned
+  into character offsets only at the interpreter boundary.
+* **Tables.** Classes (`[[:alpha:]]` and the rest) and case mappings come
+  from gawk 5.4.1 under C.UTF-8, which takes them from glibc:
+  `tools/gen_unicode_tables.py` asks gawk about every code point and
+  writes `src/unicode_tables.rs` (sorted ranges); `--check` regenerates
+  and compares, `--pyawk DIR` checks they equal pyawk v1.1's (they do).
+  It is not part of `tools/regress.sh`, since another gawk or glibc may
+  answer differently.
+* **Regex.** The NFA, DFA and search are unchanged; only `parse.rs`
+  knows about characters. The pattern is decoded into code points (an
+  invalid byte becomes U+DC00 + byte; byte escapes such as `\303\251`
+  that spell valid UTF-8 are joined into one character). Every set of
+  characters (`.`, a bracket, a class, a negation) becomes a list of
+  merged code-point ranges, which is split into UTF-8 byte-range
+  sequences (the standard split by encoded length and lead byte) and
+  built into a trie with shared prefixes; the ASCII part stays one
+  `ByteSet`, so `[a-z]` costs what it did. `.` and negated sets leave out
+  the escaped bytes, so they match characters only (pyawk, gawk).
+  Matching starts only at character boundaries (`Finder::find` rounds
+  up, looking back at most 3 bytes), and after an empty match `gsub`,
+  and `split` step one character (an empty match never splits a field).
+* **Patterns that match invalid bytes.** A pattern that names an escaped
+  byte (`/\377/` when that is not valid UTF-8) is marked *raw*. Run
+  against a text with invalid bytes, it searches a transcoded copy in
+  which each invalid byte is written as the 3-byte encoding of its
+  escape code point (ED B2/B3 xx), and the match positions are mapped
+  back (`Transcoded`). Valid text, and every pattern that is not raw,
+  runs on the bytes as they are, so the common case pays nothing.
+* **Size limit.** A character set is many byte states (`.` 35,
+  `[[:alpha:]]` about 1,100) where pyawk counts one, so UTF-8 mode
+  allows 4,000,000 states (`NFA_LIMIT_UTF8`) instead of 1,000,000:
+  `.{32767}` compiles, as in C mode and pyawk. `[[:alpha:]]{4000}` is
+  still "too big", which pyawk accepts. **Flagged decision.**
+* **Gates.** The corpus `utf8` category passes 13/13 and the UTF-8 regex
+  table (2,152 lines against pyawk v1.1) is a hard gate, as is the C
+  table. `tools/bench.py --locale C.UTF-8` runs the benchmark in UTF-8
+  mode (the default is `C`).
+
+Decisions:
+
+* **`%c` in C mode** is the low byte of the code (pyawk v1.1, gawk,
+  mawk), replacing v1.0's "256 and up as UTF-8".
+* **`%c` of a numeric string or unset variable** stays as in v1.0
+  (POSIX: the number), which differs from pyawk (see above).
+* **String comparison** is by bytes in both modes. For valid UTF-8 that
+  is code-point order; pyawk compares code points with invalid bytes at
+  U+DC80..DCFF, so the two can order an invalid byte differently against
+  a non-ASCII character: `"\200" < "é"` is 1 in hawk, mawk and gawk
+  (also with `--posix`), 0 in pyawk. **Flagged decision.**
+* **Speed.** On the benchmark UTF-8 mode is within noise of C mode; on
+  non-ASCII text `gsub(/./, ...)` and class matches cost the same as in
+  C mode and `length` about 20% more (it counts characters).

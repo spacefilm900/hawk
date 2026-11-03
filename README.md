@@ -9,17 +9,20 @@ came first, and it uses the same test corpus and the same semantic decisions.
   Rust's built-in test framework. The test runners in `tools/` are small
   Python scripts. They are test tooling only and do not ship with hawk.
 * **Bytes, not text.** Programs and data are handled as bytes (`Vec<u8>`), so
-  input that is not valid UTF-8 passes through unchanged. A UTF-8 locale mode
-  can be added on top later, as pyawk v1.1 did.
+  input that is not valid UTF-8 passes through unchanged. In a UTF-8 locale
+  (`LC_ALL`, `LC_CTYPE` or `LANG` naming UTF-8) string functions, `printf`
+  and regexes count characters instead, as in pyawk v1.1.
 * **Scope.** The first target is pyawk v1.0's feature set (tag `v1.0` of
   pyawk). The v1.1 extras are being ported on the `enhancements` branch:
-  the POSIX parse-time errors, `nextfile`, `ENVIRON` and the full I/O
-  audit are done; UTF-8 locales come next. See [PLAN.md](PLAN.md).
+  the POSIX parse-time errors, `nextfile`, `ENVIRON`, the full I/O
+  audit and UTF-8 locale mode are done. See [PLAN.md](PLAN.md).
 
 **Status:** the lexer, parser, interpreter and the POSIX regex engine are
 done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570
 regex patterns, and its `printf` agrees with the C library on an
-18,000-case table (`tools/printf_table.py`). See
+18,000-case table (`tools/printf_table.py`). On `enhancements` it passes
+all 561 corpus cases that pyawk v1.1 runs here, both regex tables (C and
+UTF-8) line for line, and 0 AST mismatches with pyawk v1.1. See
 PLAN.md for progress and the current test numbers, and `tools/bench.py` for
 a rough speed comparison with other awks.
 
