@@ -409,6 +409,8 @@ impl Dumper {
         }
     }
 
+    /// Dump one statement in the form pyawk's dump uses (its node names
+    /// and field order), so `tools/ast_check.py` can compare the trees.
     fn stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Block(b) => self.block(b),

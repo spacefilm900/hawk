@@ -849,6 +849,8 @@ impl Parser {
         Ok(Stmt::Expr(self.parse_paren_expr()?))
     }
 
+    /// A statement that is not compound: print/printf, next, nextfile,
+    /// exit, return, break, continue, delete, getline or an expression.
     fn parse_simple_statement(&mut self) -> Result<Stmt, Error> {
         let line = self.line();
         match self.tok() {
@@ -1429,6 +1431,8 @@ impl Parser {
         }
     }
 
+    /// A call of builtin `b` (its name already seen), checking the number
+    /// of arguments and where an lvalue or array is required.
     fn parse_builtin(&mut self, b: Builtin) -> Result<Expr, Error> {
         let line = self.advance().line;
         if !self.at(&Tok::LParen) {

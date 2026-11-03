@@ -205,6 +205,8 @@ fn on_big_stack<F: FnOnce(usize) -> i32 + Send + 'static>(job: F) -> i32 {
     }
 }
 
+/// Parse and run the program the command line gave, report any warning
+/// or error on standard error, and return the exit status.
 fn run(parsed: Parsed) -> i32 {
     let stack_size = parsed.config.stack_size;
     let result = crate::parser::parse_with_stack(&parsed.source, stack_size).and_then(|program| {
@@ -252,7 +254,9 @@ fn die_of_sigpipe() -> i32 {
     const SIGPIPE: i32 = 13; // the same number on Linux, the BSDs and macOS
     const SIG_DFL: usize = 0; // "the default action", a null handler
     unsafe extern "C" {
+        /// Set what the process does on a signal (`SIG_DFL`: the default).
         fn signal(signum: i32, handler: usize) -> usize;
+        /// Send a signal to this process.
         fn raise(signum: i32) -> i32;
     }
     // SAFETY: both functions only change this process's signal state.

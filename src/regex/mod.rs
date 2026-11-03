@@ -132,6 +132,8 @@ impl Regex {
         }
     }
 
+    /// `is_match` on the text to search (already transcoded if need be):
+    /// one forward pass of the DFA, stopping at the first accepting state.
     fn scan_for_match(&self, text: &[u8]) -> bool {
         if let Some(lit) = &self.literal {
             return find_bytes(text, lit, 0).is_some();
@@ -265,6 +267,9 @@ impl<'r, 't> Finder<'r, 't> {
         span.map(|(a, b)| (t.to_old[a], t.to_old[b]))
     }
 
+    /// `find` on the text to search (the transcoded one, if any): first a
+    /// direct search for a literal, then probes from each start within
+    /// the budget, and past it the precomputed start marks.
     fn find_in(&mut self, text: &[u8], pos: usize) -> Option<(usize, usize)> {
         if let Some(lit) = &self.re.literal {
             return find_bytes(text, lit, pos).map(|s| (s, s + lit.len()));

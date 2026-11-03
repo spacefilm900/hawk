@@ -263,6 +263,8 @@ impl<'p> Interp<'p> {
         Ok(())
     }
 
+    /// Set up an interpreter for `prog`: the special variables, ARGV,
+    /// ENVIRON and the `-v` assignments from `config`.  Nothing runs yet.
     pub fn new(prog: &'p Program, config: &Config) -> R<Interp<'p>> {
         let mut it = Interp {
             prog,
@@ -363,6 +365,8 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// BEGIN, the main loop and END, with `exit` handled as POSIX says:
+    /// `exit` in BEGIN or a rule still runs END; `exit` in END stops.
     fn run_inner(&mut self) -> R<()> {
         let prog = self.prog;
         let body = (|| -> R<()> {
@@ -396,6 +400,8 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// Read every main input record and run the pattern-action rules on
+    /// it (`next` and `nextfile` end the rules early).
     fn main_loop(&mut self) -> R<()> {
         while let Some(rec) = self.next_main_record()? {
             self.bump("NR");
@@ -1018,6 +1024,9 @@ impl<'p> Interp<'p> {
         })
     }
 
+    /// Run one statement.  `Flow` says how control leaves it (normally,
+    /// or by break, continue, return...), and `R` carries errors and the
+    /// unwinding of `next`, `nextfile` and `exit`.
     fn exec(&mut self, s: &'p Stmt) -> R<Flow> {
         self.check_stack()?;
         match s {
@@ -1163,6 +1172,7 @@ impl<'p> Interp<'p> {
         Ok(())
     }
 
+    /// Evaluate `args` (the format first) and format them as printf does.
     fn sprintf(&mut self, args: &'p [Expr]) -> R<Vec<u8>> {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
@@ -1484,6 +1494,8 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// Call a builtin function.  The parser has checked the argument
+    /// counts; arguments are evaluated here, as each builtin needs them.
     fn builtin(&mut self, b: Builtin, args: &'p [Expr]) -> R<Value> {
         use Builtin::*;
         let num = |n: f64| Ok(Value::Num(n));

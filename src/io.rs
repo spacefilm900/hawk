@@ -189,6 +189,9 @@ impl Io {
             .map_err(|e| write_error(e, b"/dev/stderr"))
     }
 
+    /// Open the output `name` for `>` (truncate), `>>` (append) or `|`
+    /// (a command run by the shell).  The special names are handled by
+    /// the caller before this.
     fn open_output(&mut self, kind: Redirect, name: &[u8]) -> Result<Output, Error> {
         let fail = |e: io::Error| {
             Error::Runtime(format!(
