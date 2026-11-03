@@ -19,6 +19,7 @@
 
 pub mod array;
 pub mod ast;
+pub mod charset;
 pub mod cli;
 pub mod error;
 pub mod format;
@@ -30,4 +31,5 @@ pub mod parser;
 pub mod rand;
 pub mod regex;
 pub mod subst;
+mod unicode_tables;
 pub mod value;
