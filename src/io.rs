@@ -83,8 +83,9 @@ pub struct Io {
     inputs: HashMap<Vec<u8>, Input>,
 }
 
-/// Error type for writes: a broken pipe on standard output ends the run
-/// quietly (`head` closing its input is not a mistake worth reporting).
+/// Error type for writes: a broken pipe (the reader went away) ends the
+/// run quietly by SIGPIPE (`head` closing its input is not a mistake
+/// worth reporting); anything else is "write error on NAME (reason)".
 pub fn write_error(e: io::Error, name: &[u8]) -> Error {
     if e.kind() == io::ErrorKind::BrokenPipe {
         Error::BrokenPipe

@@ -151,7 +151,7 @@ pub fn main(args: Vec<Vec<u8>>) -> i32 {
         Ok(p) => p,
         Err(None) => return 0,
         Err(Some(msg)) => {
-            eprint!("hawk: {msg}\n{USAGE}");
+            report(&format!("hawk: {msg}\n{USAGE}"));
             return 2;
         }
     };
@@ -189,7 +189,7 @@ fn on_big_stack<F: FnOnce(usize) -> i32 + Send + 'static>(job: F) -> i32 {
             return match handle.join() {
                 Ok(Some(status)) => status,
                 _ => {
-                    eprintln!("hawk: internal error");
+                    report("hawk: internal error\n");
                     2
                 }
             };
@@ -206,7 +206,7 @@ fn run(parsed: Parsed) -> i32 {
     let stack_size = parsed.config.stack_size;
     let result = crate::parser::parse_with_stack(&parsed.source, stack_size).and_then(|program| {
         for warning in &program.warnings {
-            eprintln!("hawk: warning: {warning}");
+            report(&format!("hawk: warning: {warning}\n"));
         }
         let mut interp = Interp::new(&program, &parsed.config).map_err(|u| match u {
             crate::interp::Unwind::Err(e) => e,
@@ -217,13 +217,48 @@ fn run(parsed: Parsed) -> i32 {
     });
     match result {
         Ok(status) => status,
-        Err(Error::BrokenPipe) => 2,
+        Err(Error::BrokenPipe) => die_of_sigpipe(),
         Err(e) => {
             let _ = std::io::stdout().flush();
-            eprintln!("hawk: {e}");
+            report(&format!("hawk: {e}\n"));
             2
         }
     }
+}
+
+/// Write a message to standard error.  `eprintln!` would panic if standard
+/// error cannot be written (`2>/dev/full`); the message is then lost, but
+/// the exit status still says what happened.
+fn report(msg: &str) {
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+}
+
+/// The reader of our output has gone away (`hawk ... | head -1`, or
+/// `print | "head -1"`).  A C awk is simply killed by the SIGPIPE signal at
+/// that point, silently, and the shell reports status 141; mawk, onetrue-awk,
+/// gawk and pyawk all end that way.  Rust programs ignore SIGPIPE (so a
+/// write fails with an error instead), so to end the same way we restore
+/// the default action and send the signal to ourselves.
+///
+/// That needs two C library functions, which Rust's standard library does
+/// not wrap.  `extern "C"` declares them; the C library is linked into
+/// every Rust program already, so this adds no dependency.  Calling a
+/// foreign function is `unsafe` in Rust (the compiler cannot check it);
+/// these two take plain integers and are safe to call at any time.
+fn die_of_sigpipe() -> i32 {
+    const SIGPIPE: i32 = 13; // the same number on Linux, the BSDs and macOS
+    const SIG_DFL: usize = 0; // "the default action", a null handler
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+        fn raise(signum: i32) -> i32;
+    }
+    // SAFETY: both functions only change this process's signal state.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+        raise(SIGPIPE);
+    }
+    // Not reached: the signal ends the process.  2 in case it did not.
+    2
 }
 
 /// Hidden debugging aid: `hawk --dump-ast [-f progfile]... | 'program'`
@@ -235,7 +270,7 @@ fn dump_ast(args: &[Vec<u8>]) -> i32 {
         Ok(p) => p,
         Err(None) => return 0,
         Err(Some(msg)) => {
-            eprintln!("hawk: {msg}");
+            report(&format!("hawk: {msg}\n"));
             return 2;
         }
     };
@@ -247,7 +282,7 @@ fn dump_ast(args: &[Vec<u8>]) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("hawk: {e}");
+                report(&format!("hawk: {e}\n"));
                 2
             }
         }

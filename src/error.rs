@@ -16,8 +16,9 @@ pub enum Error {
     Syntax { msg: String, line: Option<u32> },
     /// A fatal problem while the program runs.
     Runtime(String),
-    /// Standard output was closed by the reader (e.g. `hawk ... | head`):
-    /// the run stops quietly with status 2, as pyawk does.
+    /// The reader of our output went away (e.g. `hawk ... | head`, or
+    /// `print | "head -1"`): the run ends quietly by the SIGPIPE signal,
+    /// as a C awk's does (see `cli::die_of_sigpipe`).
     BrokenPipe,
 }
 
