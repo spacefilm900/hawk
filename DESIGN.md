@@ -574,6 +574,11 @@ what changes is where the characters are.
   escape code point (ED B2/B3 xx), and the match positions are mapped
   back (`Transcoded`). Valid text, and every pattern that is not raw,
   runs on the bytes as they are, so the common case pays nothing.
+  A raw regex `RS` would otherwise transcode the whole unread buffer
+  once per record (quadratic: 20,000 records took 75 s), so the record
+  reader keeps the transcoded copy of its buffer (`Transcoding`) and
+  drops it only when the buffer changes (`fill`, `use_up`, `rest`).
+  `Finder::cached` searches through that copy.
 * **Size limit.** A character set is many byte states (`.` 35,
   `[[:alpha:]]` about 1,100) where pyawk counts one, so UTF-8 mode
   allows 4,000,000 states (`NFA_LIMIT_UTF8`) instead of 1,000,000:
