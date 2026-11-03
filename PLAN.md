@@ -93,3 +93,19 @@ pyawk (via `--awk`) scores 504/0/123 and 570/0, the same as its own runners.
   agree except glibc's `%#g` slip when rounding up to a power of ten,
   where hawk keeps pyawk's (and the C standard's) answer. Integers beyond
   128 bits are now exact (`%o` of 1e40 printed a saturated value before).
+
+## v1.1 port (branch `enhancements`)
+
+pyawk v1.1's extras, in four stages; `main` stays at v1.0.
+
+* Harness: pyawk v1.1's corpus categories, the UTF-8 regex table and the
+  C regex table as a hard gate. Corpus 535/26/121, AST 0 mismatches with
+  8 programs pending.
+* Stage 1, POSIX parse-time errors and settled decisions: `next` in
+  BEGIN/END is a syntax error and allowed in a function; builtin argument
+  counts; `split` and `sub`/`gsub` targets; `printf` skips C length
+  modifiers; tests for `-v NF=3`, deep nesting and the regex corners.
+  Corpus 535/26/121 (the failures are stages 2-4), AST 7 pending.
+* Stage 2, `nextfile`: corpus 542/19/121 (golden `nextfile` 7/7), AST
+  0 pending. Left: 6 `io` cases (stage 3), 13 `utf8` cases (stage 4).
+

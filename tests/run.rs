@@ -346,3 +346,32 @@ fn deep_nesting_is_a_syntax_error() {
     assert_eq!((o.as_str(), rc), ("", 2));
     assert!(e.contains("nesting too deep"), "{e}");
 }
+
+#[test]
+fn nextfile_skips_the_rest_of_the_file() {
+    let dir = std::env::temp_dir().join(format!("hawk-nextfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a");
+    let b = dir.join("b");
+    std::fs::write(&a, "a1\na2\na3\n").unwrap();
+    std::fs::write(&b, "b1\nb2\n").unwrap();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    // FNR starts again at 1, NR does not; END still runs.
+    assert_eq!(
+        out(
+            &[
+                "FNR == 2 { nextfile } { print FNR, NR, $0 } END { print NR }",
+                a,
+                b
+            ],
+            ""
+        ),
+        "1 1 a1\n1 3 b1\n4\n"
+    );
+    // nextfile on stdin uses it up: a second "-" reads nothing.
+    assert_eq!(
+        out(&["{ print; nextfile }", "-", a, "-"], "s1\ns2\n"),
+        "s1\na1\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

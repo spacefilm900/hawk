@@ -43,16 +43,7 @@ DELIBERATE: set[str] = set()
 # Programs that pyawk v1.1 parses differently because hawk has not caught
 # up yet (the v1.1 port in progress on branch ``enhancements``).  They are
 # listed, not counted as failures; each stage empties its part.
-PENDING = {
-    # stage 2: nextfile
-    "golden/nextfile/assignment_operands.awk",
-    "golden/nextfile/first_lines.awk",
-    "golden/nextfile/in_loops.awk",
-    "golden/nextfile/ranges.awk",
-    "golden/nextfile/skip_rest.awk",
-    "golden/nextfile/stdin_used_up.awk",
-    "golden/nextfile/with_getline.awk",
-}
+PENDING: set[str] = set()  # empty: stages 1 and 2 are done
 
 
 def extract_pyawk(repo: Path, dest: Path) -> None:

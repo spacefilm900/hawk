@@ -437,3 +437,21 @@ These are rejected while parsing, so even code that never runs (`if (0)
   needing more than `NFA_LIMIT` automaton states, is a bad regex; `[z-a]`
   is invalid, `[a-c-e]` reads as mawk does (`a-c`, `-`, `e`) and `a+?` is
   `(a+)?`.
+
+### `nextfile` (stage 2)
+
+`nextfile` is a statement like `next` and travels the same way, as
+`Flow::NextFile`, out of loops and blocks to the rule loop, which calls
+`Interp::skip_file` and stops running rules on this record. It is a syntax
+error in BEGIN and END ("nextfile used in BEGIN action", mawk and gawk)
+and in a function ("nextfile is not allowed inside a function (f)"; POSIX
+leaves it undefined there, mawk and onetrue-awk reject it), so unlike
+`next` it never has to unwind through a function call.
+
+`skip_file` drops the current file, so the next record comes from the
+next operand and FNR starts again. Range state is not reset, so a range
+left open continues into the next file. Standard input cannot be reopened,
+so skipping it *uses it up* (`RecordReader::use_up`): a later `-` operand
+or `getline < "-"` finds nothing (mawk, gawk; onetrue-awk carries on).
+The rest is not read first, which could block on a terminal.
+

@@ -241,6 +241,8 @@ pub enum Stmt {
     Break,
     Continue,
     Next,
+    /// `nextfile` (POSIX 2024): skip the rest of the current input file.
+    NextFile,
     Exit(Option<Expr>),
     Return(Option<Expr>),
     /// `delete array[subs]`, or `delete array` (subs None) for all of it.
@@ -462,6 +464,7 @@ impl Dumper {
             Stmt::Break => self.w("Break()"),
             Stmt::Continue => self.w("Continue()"),
             Stmt::Next => self.w("Next()"),
+            Stmt::NextFile => self.w("NextFile()"),
             Stmt::Exit(e) => self.node("Exit", |d| d.opt(e.as_ref(), |d, e| d.expr(e))),
             Stmt::Return(e) => self.node("Return", |d| d.opt(e.as_ref(), |d, e| d.expr(e))),
             Stmt::Delete { array, subs } => self.node("Delete", |d| {

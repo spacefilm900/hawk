@@ -90,6 +90,10 @@ enum Flow {
     Break,
     Continue,
     Next,
+    /// `nextfile`.  It can only come from a rule's own action (the parser
+    /// rejects it in functions, BEGIN and END), so unlike `next` it never
+    /// has to unwind through a function call.
+    NextFile,
     /// The value is in `Interp::ret`.
     Return,
 }
@@ -416,11 +420,14 @@ impl<'p> Interp<'p> {
                     line.extend_from_slice(&self.var_str("ORS"));
                     self.io.write_stdout(&line)?;
                 }
-                Some(body) => {
-                    if self.exec_block(body)? == Flow::Next {
+                Some(body) => match self.exec_block(body)? {
+                    Flow::Next => break,
+                    Flow::NextFile => {
+                        self.skip_file();
                         break;
                     }
-                }
+                    _ => {}
+                },
             }
         }
         Ok(())
@@ -466,6 +473,19 @@ impl<'p> Interp<'p> {
                 Some(r) => return Ok(Some(r)),
                 None => self.main = Main::None,
             }
+        }
+    }
+
+    /// `nextfile`: drop the rest of the current input file, so the next
+    /// record comes from the next operand (and FNR starts again at 1).
+    /// Standard input cannot be reopened, so skipping it uses it up: a
+    /// later "-" operand or `getline < "-"` finds nothing, as in mawk and
+    /// gawk (onetrue-awk carries on where it stopped).
+    fn skip_file(&mut self) {
+        // `std::mem::replace` puts `Main::None` in and hands back the old
+        // value; dropping a `Main::File` closes the file.
+        if let Main::Stdin = std::mem::replace(&mut self.main, Main::None) {
+            self.io.stdin_reader().use_up();
         }
     }
 
@@ -1073,6 +1093,7 @@ impl<'p> Interp<'p> {
             Stmt::Break => return Ok(Flow::Break),
             Stmt::Continue => return Ok(Flow::Continue),
             Stmt::Next => return Ok(Flow::Next),
+            Stmt::NextFile => return Ok(Flow::NextFile),
             Stmt::Exit(status) => {
                 if let Some(e) = status {
                     let n = self.eval(e)?.to_num();

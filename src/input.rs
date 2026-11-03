@@ -44,6 +44,15 @@ impl RecordReader {
         }
     }
 
+    /// Make this input look finished: drop what is buffered and read no
+    /// more.  The rest is not read first, which could wait forever on a
+    /// terminal.
+    pub fn use_up(&mut self) {
+        self.buf.clear();
+        self.start = 0;
+        self.eof = true;
+    }
+
     /// Read more data into the buffer; `Ok(false)` at the end of input.
     fn fill(&mut self) -> Result<bool, Error> {
         if self.eof {

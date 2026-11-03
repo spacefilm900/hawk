@@ -882,8 +882,25 @@ impl Parser {
                 self.advance();
                 Ok(Stmt::Next)
             }
-            // pyawk v1.0 deferred `nextfile`; so does hawk's v1.0 scope.
-            Tok::Nextfile => Err(Error::syntax("nextfile is not supported yet", line)),
+            Tok::Nextfile => {
+                // There is no current file in BEGIN or END: mawk and gawk
+                // reject nextfile there while parsing (onetrue-awk only
+                // when it runs).  In a function POSIX 2024 leaves it
+                // undefined (unlike `next`); mawk and onetrue-awk reject
+                // it, gawk allows it, and we follow the majority.
+                if let Some(which) = self.in_special {
+                    return Err(Error::syntax(
+                        format!("nextfile used in {which} action"),
+                        line,
+                    ));
+                }
+                if let Some(f) = &self.in_function {
+                    let msg = format!("nextfile is not allowed inside a function ({f})");
+                    return Err(Error::syntax(msg, line));
+                }
+                self.advance();
+                Ok(Stmt::NextFile)
+            }
             Tok::Return => {
                 if self.in_function.is_none() {
                     return Err(Error::syntax("return outside a function", line));
@@ -2067,8 +2084,25 @@ mod tests {
     }
 
     #[test]
-    fn deferred_features_error_clearly() {
-        assert!(err("{ nextfile }").contains("nextfile is not supported yet"));
+    fn nextfile_in_rules() {
+        assert_eq!(
+            p("{ nextfile }").rules[0].action,
+            Some(vec![Stmt::NextFile])
+        );
+        p("FNR == 2 { if ($1) nextfile; while (1) { nextfile } }");
+    }
+
+    #[test]
+    fn nextfile_in_begin_end_or_a_function_is_a_syntax_error() {
+        // No current file in BEGIN/END: mawk and gawk reject it while
+        // parsing.  In a function POSIX leaves it undefined; mawk and
+        // onetrue-awk reject it (gawk allows it), so we do too.
+        assert!(err("BEGIN { if (0) nextfile }").contains("nextfile used in BEGIN action"));
+        assert!(err("END { nextfile }").contains("nextfile used in END action"));
+        assert!(
+            err("function f() { nextfile }")
+                .contains("nextfile is not allowed inside a function (f)")
+        );
     }
 
     #[test]

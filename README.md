@@ -12,8 +12,9 @@ came first, and it uses the same test corpus and the same semantic decisions.
   input that is not valid UTF-8 passes through unchanged. A UTF-8 locale mode
   can be added on top later, as pyawk v1.1 did.
 * **Scope.** The first target is pyawk v1.0's feature set (tag `v1.0` of
-  pyawk). The v1.1 extras come later: UTF-8 locales, `ENVIRON` and the full
-  I/O audit, `nextfile`, and the POSIX regex engine. See [PLAN.md](PLAN.md).
+  pyawk). The v1.1 extras are being ported on the `enhancements` branch:
+  the POSIX parse-time errors and `nextfile` are done; `ENVIRON` and the
+  full I/O audit, then UTF-8 locales, come next. See [PLAN.md](PLAN.md).
 
 **Status:** the lexer, parser, interpreter and the POSIX regex engine are
 done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570

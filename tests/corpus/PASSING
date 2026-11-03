@@ -274,6 +274,13 @@ io/redirect_concat_field
 io/redirect_files
 io/redirect_pipes
 io/system_calls
+nextfile/assignment_operands
+nextfile/first_lines
+nextfile/in_loops
+nextfile/ranges
+nextfile/skip_rest
+nextfile/stdin_used_up
+nextfile/with_getline
 one_liners/count_lines
 one_liners/count_matches
 one_liners/dedupe_lines
