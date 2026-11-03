@@ -27,6 +27,7 @@ fn run_with(prog: &str, input: &str, stdout: Option<File>, stderr: Option<File>)
     let out = stdout.map_or_else(Stdio::piped, Stdio::from);
     let err = stderr.map_or_else(Stdio::piped, Stdio::from);
     let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg(prog)
         .stdin(Stdio::piped())
         .stdout(out)
@@ -62,6 +63,7 @@ fn reader_going_away_kills_us_with_sigpipe() {
     // Like `awk ... | head -1`: mawk, onetrue-awk and gawk are all killed
     // by SIGPIPE (the shell shows status 141), silently.
     let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg("BEGIN { for (i = 0; i < 1000000; i++) print i }")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -93,6 +95,7 @@ fn command_going_away_kills_us_with_sigpipe() {
 #[test]
 fn reader_gone_before_the_final_flush_kills_us_with_sigpipe() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg("BEGIN { system(\"sleep 0.3\"); print \"x\" }")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -111,6 +114,7 @@ fn reader_gone_before_the_final_flush_kills_us_with_sigpipe() {
 fn ctrl_c_ends_the_run_with_status_130() {
     // A C awk is killed by SIGINT, which a shell reports as 130 (128 + 2).
     let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg("BEGIN { print \"go\"; fflush(); while (1) x++ }")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -348,6 +352,7 @@ fn dash_is_a_file_name_for_output() {
     let dir = std::env::temp_dir().join(format!("hawk-dash-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg("BEGIN { print \"dash\" > \"-\"; print \"out\" }")
         .current_dir(&dir)
         .output()

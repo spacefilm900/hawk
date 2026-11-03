@@ -24,6 +24,7 @@ use std::rc::Rc;
 
 use crate::array::{Array, FxMap, Key};
 use crate::ast::{BinOp, CmpOp, Expr, Function, GetlineKind, Program, Redirect, Stmt, UnOp};
+use crate::charset;
 use crate::error::Error;
 use crate::format::format_printf;
 use crate::input::{RecordReader, RegexFinder};
@@ -160,6 +161,9 @@ pub struct Config {
     /// spawns 2 MiB, and the main thread usually has 8 MiB).  Recursion stops with an error, rather
     /// than a crash, before it runs out.
     pub stack_size: usize,
+    /// UTF-8 mode (see `charset`): characters are UTF-8 sequences, not
+    /// bytes.  The command line sets it from the locale variables.
+    pub utf8: bool,
 }
 
 pub struct Interp<'p> {
@@ -207,6 +211,9 @@ pub struct Interp<'p> {
     /// function-call budget and the end of the stack, so runaway recursion
     /// is still reported as such, and there is room left to report it.
     eval_limit: usize,
+
+    /// UTF-8 mode (from `Config::utf8`).
+    utf8: bool,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -285,6 +292,7 @@ impl<'p> Interp<'p> {
                 let budget = Self::stack_budget(config);
                 budget + (Self::stack_size(config) - budget) / 2
             },
+            utf8: config.utf8,
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
@@ -588,7 +596,15 @@ impl<'p> Interp<'p> {
             return Ok(Vec::new());
         }
         if fs.is_empty() {
-            return Ok(s.iter().map(|&b| vec![b]).collect());
+            // One field per character.
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < s.len() {
+                let j = charset::next(s, i, self.utf8);
+                out.push(s[i..j].to_vec());
+                i = j;
+            }
+            return Ok(out);
         }
         if fs.len() == 1 {
             let c = fs[0];
@@ -1148,7 +1164,7 @@ impl<'p> Interp<'p> {
             vals.push(self.eval(a)?);
         }
         let fmt = self.to_str(&vals[0]);
-        Ok(format_printf(&fmt, &vals[1..], &self.convfmt()))
+        Ok(format_printf(&fmt, &vals[1..], &self.convfmt(), self.utf8))
     }
 
     // ======================================================= expressions
@@ -1453,6 +1469,15 @@ impl<'p> Interp<'p> {
         Ok(self.eval(e)?.to_num())
     }
 
+    /// The length of `s` in characters, as a number.
+    fn length(&self, s: &[u8]) -> f64 {
+        if self.utf8 {
+            charset::count(s) as f64
+        } else {
+            s.len() as f64
+        }
+    }
+
     fn builtin(&mut self, b: Builtin, args: &'p [Expr]) -> R<Value> {
         use Builtin::*;
         let num = |n: f64| Ok(Value::Num(n));
@@ -1460,13 +1485,19 @@ impl<'p> Interp<'p> {
             Length => {
                 Self::arity(b, args, 0, 1)?;
                 match args.first() {
-                    None => num(self.record.len() as f64),
+                    None => num(self.length(&self.record.clone())),
                     Some(Expr::Var(name)) => match self.array_if_array(name) {
                         Some(Some(arr)) => num(arr.borrow().len() as f64),
                         Some(None) => num(0.0), // untyped: stays untyped
-                        None => num(self.str_arg(&args[0])?.len() as f64),
+                        None => {
+                            let s = self.str_arg(&args[0])?;
+                            num(self.length(&s))
+                        }
                     },
-                    Some(e) => num(self.str_arg(e)?.len() as f64),
+                    Some(e) => {
+                        let s = self.str_arg(e)?;
+                        num(self.length(&s))
+                    }
                 }
             }
             Substr => {
@@ -1477,13 +1508,13 @@ impl<'p> Interp<'p> {
                     Some(e) => Some(self.num_arg(e)?),
                     None => None,
                 };
-                Ok(Value::str(substr(&s, m, n)))
+                Ok(Value::str(substr(&s, m, n, self.utf8)))
             }
             Index => {
                 Self::arity(b, args, 2, 2)?;
                 let s = self.str_arg(&args[0])?;
                 let t = self.str_arg(&args[1])?;
-                num(find(&s, &t).map_or(0.0, |k| (k + 1) as f64))
+                num(index_of(&s, &t, self.utf8) as f64)
             }
             Split => {
                 Self::arity(b, args, 2, 3)?;
@@ -1521,7 +1552,7 @@ impl<'p> Interp<'p> {
                 let text = self.str_arg(&args[0])?;
                 let re = self.regex_operand(&args[1])?;
                 let (start, length) = match re.find_at(&text, 0) {
-                    Some((s, e)) => ((s + 1) as f64, (e - s) as f64),
+                    Some((s, e)) => ((self.length(&text[..s]) + 1.0), self.length(&text[s..e])),
                     None => (0.0, -1.0),
                 };
                 self.set_global("RSTART", Value::Num(start))?;
@@ -1608,11 +1639,7 @@ impl<'p> Interp<'p> {
             Tolower | Toupper => {
                 Self::arity(b, args, 1, 1)?;
                 let s = self.str_arg(&args[0])?;
-                let out: Vec<u8> = if b == Tolower {
-                    s.to_ascii_lowercase()
-                } else {
-                    s.to_ascii_uppercase()
-                };
+                let out = charset::change_case(&s, b == Toupper, self.utf8);
                 Ok(Value::Str(Rc::from(out)))
             }
             System => {
@@ -1674,11 +1701,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// `substr(s, m[, n])`, counting bytes from 1 (pyawk's rules: truncate
-/// toward zero; a start below 1 does not shorten the length; NaN start is
-/// 1, NaN length gives "").
-fn substr(s: &[u8], m: f64, n: Option<f64>) -> &[u8] {
-    let size = s.len() as f64;
+/// `substr(s, m[, n])`, counting characters from 1 (pyawk's rules:
+/// truncate toward zero; a start below 1 does not shorten the length; NaN
+/// start is 1, NaN length gives "").  Characters are bytes unless `utf8`;
+/// an invalid byte is one character and is kept as it is.
+fn substr(s: &[u8], m: f64, n: Option<f64>, utf8: bool) -> &[u8] {
+    let chars = utf8 && !s.is_ascii();
+    let size = if chars { charset::count(s) } else { s.len() } as f64;
     let clamp = |x: f64, lo: f64, hi: f64| {
         if x <= lo {
             lo
@@ -1699,26 +1728,79 @@ fn substr(s: &[u8], m: f64, n: Option<f64>) -> &[u8] {
         Some(n) => clamp(n, 0.0, size + 1.0 - start),
     };
     let from = start as usize - 1;
+    if chars {
+        let a = charset::byte_offset(s, from);
+        let b = a + charset::byte_offset(&s[a..], length as usize);
+        return &s[a..b];
+    }
     &s[from..from + length as usize]
+}
+
+/// `index(s, t)`: the character position of `t` in `s` (1-based), or 0.
+fn index_of(s: &[u8], t: &[u8], utf8: bool) -> usize {
+    if !utf8 || s.is_ascii() {
+        return find(s, t).map_or(0, |k| k + 1);
+    }
+    if std::str::from_utf8(t).is_ok() {
+        // A valid string can only be found at character boundaries: its
+        // first byte is never a continuation byte, and it ends with a
+        // whole character.
+        return find(s, t).map_or(0, |k| charset::count(&s[..k]) + 1);
+    }
+    // `t` holds invalid bytes: try each character start.
+    let mut i = 0;
+    let mut k = 1;
+    while i <= s.len() {
+        if s[i..].starts_with(t)
+            && (i + t.len() == s.len() || charset::is_boundary(&s[i..], t.len()))
+        {
+            return k;
+        }
+        if i == s.len() {
+            break;
+        }
+        i += charset::char_len(s, i);
+        k += 1;
+    }
+    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn substr_c(s: &[u8], m: f64, n: Option<f64>) -> &[u8] {
+        substr(s, m, n, false)
+    }
+
+    #[test]
+    fn utf8_substr_and_index_count_characters() {
+        let u = |s: &str, m: f64, n: Option<f64>| substr(s.as_bytes(), m, n, true).to_vec();
+        assert_eq!(u("héllo", 2.0, Some(3.0)), "éll".as_bytes());
+        assert_eq!(u("日本語", 3.0, None), "語".as_bytes());
+        assert_eq!(substr(b"a\xffb\xc3", 2.0, Some(3.0), true), b"\xffb\xc3");
+        assert_eq!(index_of("héllo".as_bytes(), b"l", true), 3);
+        assert_eq!(index_of("héllo".as_bytes(), b"l", false), 4);
+        assert_eq!(index_of(b"\xc3\xa9\xa9", b"\xa9", true), 2);
+        assert_eq!(index_of("é".as_bytes(), b"\xa9", true), 0);
+        assert_eq!(index_of("é".as_bytes(), b"\xc3", true), 0);
+        assert_eq!(index_of(b"\xc3", b"\xc3", true), 1);
+        assert_eq!(index_of(b"ab", b"", true), 1);
+    }
+
     #[test]
     fn substr_rules() {
-        assert_eq!(substr(b"hello", 2.0, Some(3.0)), b"ell");
-        assert_eq!(substr(b"hello", 0.0, Some(2.0)), b"he");
-        assert_eq!(substr(b"hello", -1.0, None), b"hello");
-        assert_eq!(substr(b"hello", 4.0, Some(100.0)), b"lo");
-        assert_eq!(substr(b"hello", 2.7, Some(1.9)), b"e");
-        assert_eq!(substr(b"hello", 9.0, None), b"");
-        assert_eq!(substr(b"hello", 2.0, Some(-1.0)), b"");
-        assert_eq!(substr(b"hello", f64::NAN, Some(2.0)), b"he");
-        assert_eq!(substr(b"hello", 1.0, Some(f64::NAN)), b"");
+        assert_eq!(substr_c(b"hello", 2.0, Some(3.0)), b"ell");
+        assert_eq!(substr_c(b"hello", 0.0, Some(2.0)), b"he");
+        assert_eq!(substr_c(b"hello", -1.0, None), b"hello");
+        assert_eq!(substr_c(b"hello", 4.0, Some(100.0)), b"lo");
+        assert_eq!(substr_c(b"hello", 2.7, Some(1.9)), b"e");
+        assert_eq!(substr_c(b"hello", 9.0, None), b"");
+        assert_eq!(substr_c(b"hello", 2.0, Some(-1.0)), b"");
+        assert_eq!(substr_c(b"hello", f64::NAN, Some(2.0)), b"he");
+        assert_eq!(substr_c(b"hello", 1.0, Some(f64::NAN)), b"");
         assert_eq!(
-            substr(b"hello", f64::NEG_INFINITY, Some(f64::INFINITY)),
+            substr_c(b"hello", f64::NEG_INFINITY, Some(f64::INFINITY)),
             b"hello"
         );
     }

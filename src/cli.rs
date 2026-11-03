@@ -35,7 +35,10 @@ struct Parsed {
 /// `Err(Some(msg))` is a usage error; `Err(None)` means "done, exit 0"
 /// (after --version or --help).
 fn parse_args(args: &[Vec<u8>]) -> Result<Parsed, Option<String>> {
-    let mut config = Config::default();
+    let mut config = Config {
+        utf8: crate::charset::utf8_from_env(),
+        ..Config::default()
+    };
     let mut progfiles: Vec<Vec<u8>> = Vec::new();
     let mut i = 0;
     while i < args.len() {

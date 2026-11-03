@@ -19,6 +19,7 @@
 //! `%-10s` or `%8.2f`.  Each conversion takes the next argument; missing
 //! arguments count as uninitialized (0 or "").
 
+use crate::charset;
 use crate::value::{Value, special_float_str};
 
 /// The largest width or precision used, whether written in the format
@@ -143,9 +144,10 @@ fn to_c_int(n: f64) -> i128 {
 }
 
 /// Pad `body` to the width: on the right with `-`, otherwise on the left.
-fn pad(out: &mut Vec<u8>, body: &[u8], spec: &Spec) {
+/// `size` is how many characters `body` holds (its length in C mode).
+fn pad_chars(out: &mut Vec<u8>, body: &[u8], size: usize, spec: &Spec) {
     let w = spec.width.unwrap_or(0);
-    let fill = w.saturating_sub(body.len());
+    let fill = w.saturating_sub(size);
     if !spec.minus {
         out.extend(std::iter::repeat_n(b' ', fill));
     }
@@ -153,6 +155,11 @@ fn pad(out: &mut Vec<u8>, body: &[u8], spec: &Spec) {
     if spec.minus {
         out.extend(std::iter::repeat_n(b' ', fill));
     }
+}
+
+/// Pad a body of single-byte characters (numbers).
+fn pad(out: &mut Vec<u8>, body: &[u8], spec: &Spec) {
+    pad_chars(out, body, body.len(), spec);
 }
 
 /// Pad a number: `prefix` is the sign and/or `0x`, `digits` the rest.
@@ -448,8 +455,10 @@ fn format_float(out: &mut Vec<u8>, spec: &Spec, x: f64) {
 }
 
 /// `printf`/`sprintf`: format `args` with `fmt`.  `convfmt` converts
-/// numbers given to `%s`/`%c`.
-pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
+/// numbers given to `%s`/`%c`.  In UTF-8 mode (`utf8`) `%c` of a number
+/// writes that code point, `%c` of a string its first character, and the
+/// widths and precisions of `%s` and `%c` count characters.
+pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let mut next = 0;
     // A closure that hands out the next argument (None when they ran
@@ -495,31 +504,26 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
         // `%c` is the one conversion where a missing argument differs from
         // an unset variable (see below); for the others both are 0 or "".
         if spec.conv == b'c' {
-            let ch: Vec<u8> = match arg {
-                None => Vec::new(),
+            let mut ch = Vec::new();
+            match arg {
+                None => {}
                 // An unset variable is the number 0: a NUL byte.
-                Some(Value::Uninit) => vec![0],
+                Some(Value::Uninit) => ch.push(0),
                 // A numeric string (such as a field "65") counts as a
                 // number here, as POSIX says: `|` matches either variant.
                 Some(Value::Num(n) | Value::StrNum(_, n)) => {
-                    let c = to_c_int(n);
-                    if (0..256).contains(&c) {
-                        vec![c as u8]
-                    } else {
-                        // `u32::try_from` fails for negative codes and
-                        // ones past 32 bits (`as u32` would keep the low
-                        // bits); `char::from_u32` then rejects anything
-                        // that is not a Unicode scalar value.
-                        u32::try_from(c)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(|ch| ch.to_string().into_bytes())
-                            .unwrap_or_default()
+                    charset::char_for_code(n.trunc(), utf8, &mut ch)
+                }
+                Some(other) => {
+                    let s = other.to_str(convfmt);
+                    if !s.is_empty() {
+                        let n = if utf8 { charset::char_len(&s, 0) } else { 1 };
+                        ch.extend_from_slice(&s[..n]);
                     }
                 }
-                Some(other) => other.to_str(convfmt).iter().take(1).copied().collect(),
             };
-            pad(&mut out, &ch, &spec);
+            let size = if ch.is_empty() { 0 } else { 1 };
+            pad_chars(&mut out, &ch, size, &spec);
             continue;
         }
         let v = arg.unwrap_or(Value::Uninit);
@@ -527,11 +531,19 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8]) -> Vec<u8> {
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => format_int(&mut out, &spec, v.to_num()),
             b's' => {
                 let s = v.to_str(convfmt);
-                let s = match spec.prec {
-                    Some(p) if p < s.len() => &s[..p],
-                    _ => &s[..],
-                };
-                pad(&mut out, s, &spec);
+                if utf8 && !s.is_ascii() {
+                    let s = match spec.prec {
+                        Some(p) => &s[..charset::byte_offset(&s, p)],
+                        None => &s[..],
+                    };
+                    pad_chars(&mut out, s, charset::count(s), &spec);
+                } else {
+                    let s = match spec.prec {
+                        Some(p) if p < s.len() => &s[..p],
+                        _ => &s[..],
+                    };
+                    pad(&mut out, s, &spec);
+                }
             }
             _ => format_float(&mut out, &spec, v.to_num()),
         }
@@ -553,9 +565,9 @@ pub fn format_number(fmt: &[u8], n: f64) -> Vec<u8> {
         _ => false,
     };
     if ok {
-        format_printf(fmt, &[Value::Num(n)], b"%.6g")
+        format_printf(fmt, &[Value::Num(n)], b"%.6g", false)
     } else {
-        format_printf(b"%.6g", &[Value::Num(n)], b"%.6g")
+        format_printf(b"%.6g", &[Value::Num(n)], b"%.6g", false)
     }
 }
 
@@ -564,7 +576,11 @@ mod tests {
     use super::*;
 
     fn f(fmt: &str, args: &[Value]) -> String {
-        String::from_utf8(format_printf(fmt.as_bytes(), args, b"%.6g")).unwrap()
+        String::from_utf8(format_printf(fmt.as_bytes(), args, b"%.6g", false)).unwrap()
+    }
+    /// The same in UTF-8 mode, as raw bytes.
+    fn fu(fmt: &str, args: &[Value]) -> Vec<u8> {
+        format_printf(fmt.as_bytes(), args, b"%.6g", true)
     }
     fn n(x: f64) -> Value {
         Value::Num(x)
@@ -697,14 +713,30 @@ mod tests {
     }
 
     #[test]
-    fn char_of_out_of_range_codes_is_empty() {
-        // Like pyawk: a code below 0 or past U+10FFFF writes nothing, even
-        // when its low 32 bits would make a valid character.
-        assert_eq!(f("[%c]", &[n(-1.0)]), "[]");
-        assert_eq!(f("[%c]", &[n(-4294967231.0)]), "[]");
-        assert_eq!(f("[%c]", &[n(4294967361.0)]), "[]");
-        assert_eq!(f("[%c]", &[n(1114112.0)]), "[]");
-        assert_eq!(f("[%c]", &[n(1114111.0)]), "[\u{10FFFF}]");
+    fn char_codes_in_c_mode_are_the_low_byte() {
+        // pyawk v1.1, gawk and mawk: in the C locale %c writes the byte
+        // n mod 256, whatever n is.
+        let fb = |fmt: &str, args: &[Value]| format_printf(fmt.as_bytes(), args, b"%.6g", false);
+        assert_eq!(fb("[%c]", &[n(-1.0)]), b"[\xff]");
+        assert_eq!(fb("[%c]", &[n(4294967361.0)]), b"[A]");
+        assert_eq!(fb("[%c]", &[n(256.0)]), b"[\0]");
+        assert_eq!(fb("[%c]", &[n(233.0)]), b"[\xe9]");
+    }
+
+    #[test]
+    fn utf8_mode_counts_characters() {
+        assert_eq!(fu("[%c]", &[n(233.0)]), "[é]".as_bytes());
+        assert_eq!(fu("[%3c]", &[n(8364.0)]), "[  €]".as_bytes());
+        assert_eq!(fu("[%c]", &[s("éa")]), "[é]".as_bytes());
+        assert_eq!(
+            fu("[%5s|%-4s|%.2s]", &[s("日本"), s("é"), s("añb")]),
+            "[   日本|é   |añ]".as_bytes()
+        );
+        assert_eq!(
+            fu("[%.1s|%2s]", &[s("ÿ"), Value::str(b"\xff")]),
+            b"[\xc3\xbf| \xff]"
+        );
+        assert_eq!(fu("[%c]", &[n(1114111.0)]), "[\u{10FFFF}]".as_bytes());
     }
 
     #[test]

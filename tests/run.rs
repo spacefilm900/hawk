@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 /// Returns (stdout, stderr, exit status).
 fn hawk(args: &[&str], input: &str) -> (String, String, i32) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -388,6 +389,7 @@ fn environ_values_are_strnums_but_hex_is_a_string() {
         ENVIRON["SP"] = "changed"; system("echo \"[$SP]\"")
     }"#;
     let out = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C") // C mode unless a test says otherwise
         .arg(prog)
         .env("SP", " 42 ")
         .env("EX", "1e2")
