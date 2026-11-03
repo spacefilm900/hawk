@@ -284,3 +284,9 @@ fn runs_when_the_big_stack_cannot_be_reserved() {
         ("1\n", "", Some(0))
     );
 }
+
+#[test]
+fn version_is_1_0() {
+    // `--version` prints the version from Cargo.toml; v1.0 is the first release.
+    assert_eq!(out(&["--version"], ""), "hawk 1.0.0\n");
+}
