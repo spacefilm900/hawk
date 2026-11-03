@@ -1,4 +1,5 @@
-# CodeRabbit settings for the hawk review PR (main -> review-base).
+# CodeRabbit settings for the hawk review PRs (main -> review-base for v1.0,
+# enhancements -> main for the v1.1 port).  Review vehicles only.
 language: "en-US"
 reviews:
   profile: "assertive"
@@ -15,13 +16,20 @@ reviews:
     - "!tests/corpus/**"
     - "!tests/data/**"
     - "!Cargo.lock"
+    # Generated from gawk by tools/gen_unicode_tables.py (checked by --check).
+    - "!src/unicode_tables.rs"
+    # A verbatim copy of pyawk v1.1's design notes, kept for reference.
+    - "!docs/pyawk-v1.1-DESIGN.md"
   path_instructions:
     - path: "src/**/*.rs"
       instructions: >-
-        hawk is a zero-dependency (std only) Rust port of pyawk v1.0, a POSIX
-        AWK. Semantics follow pyawk v1.0; ties go to POSIX, otherwise to the
-        majority of onetrue-awk, gawk --posix and mawk. Deliberate
-        differences are listed in DESIGN.md. Data is handled as bytes.
+        hawk is a zero-dependency (std only) Rust port of pyawk (v1.0 on
+        main, v1.1 on enhancements), a POSIX AWK. Semantics follow pyawk;
+        ties go to POSIX, otherwise to the majority of onetrue-awk, gawk
+        --posix and mawk. Deliberate differences are listed in DESIGN.md.
+        Data is handled as bytes; in a UTF-8 locale, string functions,
+        printf and regexes count characters (invalid bytes are characters
+        of their own and pass through unchanged).
         Comments are written for readers new to Rust. Look for correctness
         bugs, panics on hostile input, unbounded memory or time, and
         divergence from POSIX awk behaviour.
