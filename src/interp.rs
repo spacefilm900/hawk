@@ -1394,7 +1394,7 @@ impl<'p> Interp<'p> {
                     |t: &[u8], p: usize| re.as_deref().and_then(|r| Finder::new(r, t).find(p));
                 let finder: Option<RegexFinder> = re.is_some().then_some(&find);
                 let got = if kind == GetlineKind::File {
-                    match self.io.input_file(&name) {
+                    match self.io.input_file(&name)? {
                         None => return Ok(Value::Num(-1.0)),
                         Some(reader) => reader.read_record(&rs, finder)?,
                     }

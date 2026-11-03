@@ -134,7 +134,6 @@ fn ctrl_c_ends_the_run_with_status_130() {
 // ----------------------------------------------------------- bad names
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn null_file_or_command_name_is_an_error() {
     // onetrue-awk and gawk stop with a fatal error (mawk returns -1 / 0).
     for prog in [
@@ -198,7 +197,6 @@ fn fflush_of_a_full_file_stops_the_program() {
 // ---------------------------------------------------------------- close
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn close_dev_stdout_keeps_standard_output() {
     // All three references return 0; afterwards gawk keeps writing to
     // standard output (mawk and onetrue-awk lose later output).
@@ -210,7 +208,6 @@ fn close_dev_stdout_keeps_standard_output() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn close_dev_stderr_after_printing_to_it_returns_zero() {
     let r = run(
         "BEGIN { print \"e\" > \"/dev/stderr\"; print close(\"/dev/stderr\"); \
@@ -234,7 +231,6 @@ fn close_of_a_special_name_never_used_returns_minus_one() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn close_of_stdin_read_by_getline_uses_it_up() {
     for name in ["-", "/dev/stdin"] {
         let prog = format!(
@@ -279,7 +275,6 @@ fn close_on_a_full_disk_stops_the_program() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn close_dev_stdout_on_a_full_disk_stops_the_program() {
     let Some(f) = full() else { return };
     let prog = "BEGIN { printf \"x\" > \"/dev/stdout\"; close(\"/dev/stdout\"); \
@@ -306,7 +301,6 @@ fn a_file_that_cannot_be_written_at_exit_is_a_write_error() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn unwritable_stderr_gives_status_2() {
     // No message can be shown, but the status says something went wrong
     // (mawk, onetrue-awk and gawk all exit with 2).
@@ -351,7 +345,6 @@ fn close_returns_the_exit_status_of_a_command() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn dash_is_a_file_name_for_output() {
     // mawk and onetrue-awk write a file called "-" (gawk: standard output).
     let dir = std::env::temp_dir().join(format!("hawk-dash-{}", std::process::id()));

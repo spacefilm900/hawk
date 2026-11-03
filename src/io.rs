@@ -7,7 +7,7 @@
 //!
 //! Commands run through `/bin/sh -c`, as `system(3)` and `popen(3)` do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, IsTerminal, Write};
@@ -81,6 +81,23 @@ pub struct Io {
     pub stdin: Option<RecordReader>,
     outputs: HashMap<Vec<u8>, Output>,
     inputs: HashMap<Vec<u8>, Input>,
+    /// The special names "/dev/stdout" and "/dev/stderr" (for output) and
+    /// "-" and "/dev/stdin" (for getline) that the program has used since
+    /// it last closed them.  They are never really opened, so they are not
+    /// in `outputs` or `inputs`; this set lets `close()` tell "open"
+    /// (returns 0) from "never opened" (returns -1), as pyawk does.
+    specials_used: HashSet<Vec<u8>>,
+}
+
+/// An empty file or command name is a fatal error, as in onetrue-awk, gawk
+/// and pyawk (mawk quietly fails instead).  `what` is "print" or "getline".
+fn check_name(name: &[u8], what: &str) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::Runtime(format!(
+            "null file name in {what} redirection"
+        )));
+    }
+    Ok(())
 }
 
 /// Error type for writes: a broken pipe (the reader went away) ends the
@@ -112,6 +129,7 @@ impl Io {
             stdin: None,
             outputs: HashMap::new(),
             inputs: HashMap::new(),
+            specials_used: HashSet::new(),
         }
     }
 
@@ -132,17 +150,21 @@ impl Io {
     }
 
     /// Write `data` to the redirection `kind name`, opening it the first
-    /// time.  "/dev/stdout" and "-" mean standard output, "/dev/stderr"
-    /// standard error.
+    /// time.  "/dev/stdout" means standard output and "/dev/stderr"
+    /// standard error.  "-" is an ordinary file name here, as in mawk and
+    /// onetrue-awk (only gawk treats it as standard output); for getline it
+    /// does mean standard input.
     pub fn write_to(&mut self, kind: Redirect, name: &[u8], data: &[u8]) -> Result<(), Error> {
         if !self.outputs.contains_key(name) {
+            check_name(name, "print")?;
             match name {
-                b"/dev/stdout" | b"-" => return self.write_stdout(data),
+                b"/dev/stdout" => {
+                    self.specials_used.insert(name.to_vec());
+                    return self.write_stdout(data);
+                }
                 b"/dev/stderr" => {
-                    // Keep the order of stdout and stderr text sensible.
-                    let _ = self.stdout.flush();
-                    let _ = io::stderr().write_all(data);
-                    return Ok(());
+                    self.specials_used.insert(name.to_vec());
+                    return self.write_stderr(data);
                 }
                 _ => {}
             }
@@ -154,6 +176,17 @@ impl Io {
         out.writer()
             .write_all(data)
             .map_err(|e| write_error(e, name))
+    }
+
+    /// Write `data` to standard error, which is not buffered.  Our own
+    /// standard output is flushed first, to keep the two in a sensible
+    /// order.  A failure (`2>/dev/full`) stops the program with status 2,
+    /// as in mawk, onetrue-awk and gawk; the message itself is lost.
+    fn write_stderr(&mut self, data: &[u8]) -> Result<(), Error> {
+        let _ = self.stdout.flush();
+        io::stderr()
+            .write_all(data)
+            .map_err(|e| write_error(e, b"/dev/stderr"))
     }
 
     fn open_output(&mut self, kind: Redirect, name: &[u8]) -> Result<Output, Error> {
@@ -188,17 +221,25 @@ impl Io {
     }
 
     /// The reader for `getline < name`; `None` if the file cannot be opened.
-    pub fn input_file(&mut self, name: &[u8]) -> Option<&mut RecordReader> {
-        if (name == b"-" || name == b"/dev/stdin") && !self.inputs.contains_key(name) {
-            return Some(self.stdin_reader());
+    /// "-" and "/dev/stdin" read standard input, through the reader the
+    /// main input and plain getline use too, so the three see consecutive
+    /// records (onetrue-awk; in mawk and gawk each name gets its own
+    /// buffer and the first can swallow the whole pipe).
+    pub fn input_file(&mut self, name: &[u8]) -> Result<Option<&mut RecordReader>, Error> {
+        check_name(name, "getline")?;
+        if name == b"-" || name == b"/dev/stdin" {
+            self.specials_used.insert(name.to_vec());
+            return Ok(Some(self.stdin_reader()));
         }
         if !self.inputs.contains_key(name) {
-            let f = File::open(OsStr::from_bytes(name)).ok()?;
+            let Ok(f) = File::open(OsStr::from_bytes(name)) else {
+                return Ok(None);
+            };
             // A directory opens, but reading it fails: treat it as a file
             // that cannot be read, so getline returns -1 (pyawk, whose
             // open() refuses directories; gawk and mawk also give -1).
             if f.metadata().is_ok_and(|m| m.is_dir()) {
-                return None;
+                return Ok(None);
             }
             let input = Input {
                 reader: RecordReader::new(Box::new(f)),
@@ -206,12 +247,13 @@ impl Io {
             };
             self.inputs.insert(name.to_vec(), input);
         }
-        self.inputs.get_mut(name).map(|i| &mut i.reader)
+        Ok(self.inputs.get_mut(name).map(|i| &mut i.reader))
     }
 
     /// The reader for `cmd | getline`, starting the command the first time.
     pub fn input_cmd(&mut self, cmd: &[u8]) -> Result<&mut RecordReader, Error> {
         if !self.inputs.contains_key(cmd) {
+            check_name(cmd, "getline")?;
             self.flush_all();
             let mut child = shell(cmd).stdout(Stdio::piped()).spawn().map_err(|e| {
                 Error::Runtime(format!(
@@ -231,13 +273,36 @@ impl Io {
     }
 
     /// `close(name)`: the command's exit status, 0 for a file, -1 if
-    /// nothing by that name is open.  Output still in a file's buffer is
-    /// written now; if that fails (a full disk, say) the data is lost, so
-    /// it is an error, as in gawk, mawk and onetrue-awk.
+    /// nothing by that name is open.
+    ///
+    /// Our own pending standard output is *not* flushed first (mawk and
+    /// onetrue-awk don't either; gawk does), so a command's output can come
+    /// before lines printed after starting it.  Starting a command does
+    /// flush everything, so lines printed before it always come first.
+    ///
+    /// Output still in a file's buffer is written now; if that fails (a
+    /// full disk, say) the data is lost, so it is an error, "write error on
+    /// NAME", as in gawk, mawk and onetrue-awk.  A command that stopped
+    /// reading is not an error: its exit status is the answer.
+    ///
+    /// The special names are never really opened (see `specials_used`).
+    /// Closing one the program used returns 0, as in all three reference
+    /// awks: "/dev/stdout" and "/dev/stderr" are flushed but stay usable
+    /// (gawk; mawk and onetrue-awk really close the descriptor and lose
+    /// later output); "-" and "/dev/stdin" use up standard input, which
+    /// cannot be reopened, so later reads of it find nothing.  A special
+    /// name never used returns -1 like any other name not open (gawk).
     pub fn close(&mut self, name: &[u8]) -> Result<f64, Error> {
+        if self.specials_used.remove(name) {
+            match name {
+                b"/dev/stdout" => self.stdout.flush().map_err(|e| write_error(e, name))?,
+                b"/dev/stderr" => io::stderr().flush().map_err(|e| write_error(e, name))?,
+                _ => self.stdin_reader().use_up(),
+            }
+            return Ok(0.0);
+        }
         let mut status = -1.0;
         if let Some(out) = self.outputs.remove(name) {
-            let _ = self.stdout.flush();
             status = match out {
                 Output::File(mut w) => {
                     w.flush().map_err(|e| write_error(e, name))?;
