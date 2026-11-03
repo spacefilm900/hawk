@@ -42,6 +42,7 @@ mod nfa;
 mod parse;
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::error::Error;
 use dfa::{ACCEPT, ACCEPT_END, DEAD, Dfa};
@@ -110,9 +111,9 @@ impl Regex {
     }
 
     /// The text a raw regex must run on instead of `text`, if any.
-    fn transcode(&self, text: &[u8]) -> Option<Transcoded> {
+    fn transcode(&self, text: &[u8]) -> Option<Rc<Transcoded>> {
         if self.raw {
-            Transcoded::new(text)
+            Transcoded::new(text).map(Rc::new)
         } else {
             None
         }
@@ -211,7 +212,9 @@ pub struct Finder<'r, 't> {
     re: &'r Regex,
     text: &'t [u8],
     /// The text to search instead, for a raw regex on invalid UTF-8.
-    trans: Option<Transcoded>,
+    /// `Rc` (a shared, reference-counted pointer) lets a [`Transcoding`]
+    /// cache hand the same copy to many finders.
+    trans: Option<Rc<Transcoded>>,
     budget: usize,
     /// `marks[p]`: a match starts at p (computed when the budget runs out).
     marks: Option<Vec<bool>>,
@@ -220,6 +223,23 @@ pub struct Finder<'r, 't> {
 impl<'r, 't> Finder<'r, 't> {
     pub fn new(re: &'r Regex, text: &'t [u8]) -> Finder<'r, 't> {
         let trans = re.transcode(text);
+        Finder::with_transcoded(re, text, trans)
+    }
+
+    /// Like `new`, for a text that is searched again and again (a record
+    /// reader's buffer, once per record): the transcoded copy a raw regex
+    /// needs is made once and kept in `cache`, which the caller must
+    /// clear whenever `text` changes.
+    pub fn cached(re: &'r Regex, text: &'t [u8], cache: &mut Transcoding) -> Finder<'r, 't> {
+        let trans = if re.raw { cache.get(text) } else { None };
+        Finder::with_transcoded(re, text, trans)
+    }
+
+    fn with_transcoded(
+        re: &'r Regex,
+        text: &'t [u8],
+        trans: Option<Rc<Transcoded>>,
+    ) -> Finder<'r, 't> {
         let n = trans.as_ref().map_or(text.len(), |t| t.text.len());
         Finder {
             re,
@@ -236,15 +256,13 @@ impl<'r, 't> Finder<'r, 't> {
             // Matches start on characters (see the top of this file).
             pos = crate::charset::round_up(self.text, pos);
         }
-        // `take` moves the transcoded text out for the call (so `self` can
-        // be borrowed mutably meanwhile) and it is put back after.
-        let Some(t) = self.trans.take() else {
+        // Cloning the `Rc` copies a pointer, not the text; holding our own
+        // pointer lets `self` be borrowed mutably meanwhile.
+        let Some(t) = self.trans.clone() else {
             return self.find_in(self.text, pos);
         };
         let span = self.find_in(&t.text, t.to_new[pos]);
-        let span = span.map(|(a, b)| (t.to_old[a], t.to_old[b]));
-        self.trans = Some(t);
-        span
+        span.map(|(a, b)| (t.to_old[a], t.to_old[b]))
     }
 
     fn find_in(&mut self, text: &[u8], pos: usize) -> Option<(usize, usize)> {
@@ -343,11 +361,33 @@ impl<'r, 't> Finder<'r, 't> {
     }
 }
 
+/// A remembered [`Transcoded`] copy of one text (or the knowledge that
+/// the text is valid UTF-8 and needs none), for [`Finder::cached`].  The
+/// owner of the text calls `clear` whenever the text changes.
+#[derive(Default)]
+pub struct Transcoding {
+    /// `None`: not worked out yet.  `Some(None)`: the text is valid.
+    copy: Option<Option<Rc<Transcoded>>>,
+}
+
+impl Transcoding {
+    /// Forget the copy (the text has changed).
+    pub fn clear(&mut self) {
+        self.copy = None;
+    }
+
+    fn get(&mut self, text: &[u8]) -> Option<Rc<Transcoded>> {
+        self.copy
+            .get_or_insert_with(|| Transcoded::new(text).map(Rc::new))
+            .clone()
+    }
+}
+
 /// UTF-8 mode: a text that is not valid UTF-8, rewritten for a raw regex
 /// with each invalid byte b as the three bytes that encode U+DC00+b
 /// (`ED B2 80`..`ED B3 BF`), which is what the pattern's escaped bytes
 /// compile to.  Valid characters are copied as they are.
-struct Transcoded {
+pub struct Transcoded {
     text: Vec<u8>,
     /// `to_new[i]`: where offset i of the original text is in `text` (an
     /// offset inside a character maps to the end of that character).

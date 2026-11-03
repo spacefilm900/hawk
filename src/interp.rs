@@ -31,7 +31,7 @@ use crate::input::{RecordReader, RegexFinder};
 use crate::io::{Io, strerror};
 use crate::lexer::{Builtin, process_escapes};
 use crate::rand::Random;
-use crate::regex::{Finder, Regex, nfa_limit};
+use crate::regex::{Finder, Regex, Transcoding, nfa_limit};
 use crate::subst::{split_regex, substitute};
 use crate::value::{Value, compare, empty, num_to_str};
 
@@ -471,7 +471,9 @@ impl<'p> Interp<'p> {
             }
             let rs = self.var_str("RS");
             let re = self.rs_regex(&rs)?;
-            let find = |t: &[u8], p: usize| re.as_deref().and_then(|r| Finder::new(r, t).find(p));
+            let find = |t: &[u8], p: usize, c: &mut Transcoding| {
+                re.as_deref().and_then(|r| Finder::cached(r, t, c).find(p))
+            };
             let finder: Option<RegexFinder> = re.is_some().then_some(&find);
             let rec = match &mut self.main {
                 Main::Stdin => self.io.stdin_reader().read_record(&rs, finder)?,
@@ -1415,8 +1417,9 @@ impl<'p> Interp<'p> {
                     place = Some(self.resolve_target(t)?);
                 }
                 let re = self.rs_regex(&rs)?;
-                let find =
-                    |t: &[u8], p: usize| re.as_deref().and_then(|r| Finder::new(r, t).find(p));
+                let find = |t: &[u8], p: usize, c: &mut Transcoding| {
+                    re.as_deref().and_then(|r| Finder::cached(r, t, c).find(p))
+                };
                 let finder: Option<RegexFinder> = re.is_some().then_some(&find);
                 let got = if kind == GetlineKind::File {
                     match self.io.input_file(&name)? {

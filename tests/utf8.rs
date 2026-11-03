@@ -143,3 +143,44 @@ fn invalid_bytes_match_only_themselves() {
     // The C locale: every byte is a character.
     assert_eq!(run_in("C", prog, b"b\xe9b\xc3\xa9\n"), b"1 1 2\n");
 }
+
+/// A regex RS that names an invalid byte runs on a transcoded copy of the
+/// input.  That copy must be made once per input, not once per record:
+/// made per record, 20,000 records of 18 bytes took 75 seconds.
+#[test]
+fn raw_regex_rs_is_linear_in_the_input() {
+    let input: Vec<u8> = (0..50_000)
+        .flat_map(|i| {
+            format!("line {i} café ")
+                .into_bytes()
+                .into_iter()
+                .chain([0xff, b'\n'])
+        })
+        .collect();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C.UTF-8")
+        .arg(r#"BEGIN { RS = "\377\n" } END { print NR, $0 }"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("hawk runs");
+    // Feed the input from another thread, so a slow hawk cannot block us.
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("RS = \"\\377\\n\" over 50,000 records took over 20 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    feeder.join().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "50000 line 49999 café \n"
+    );
+}

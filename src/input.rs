@@ -15,14 +15,18 @@
 use std::io::Read;
 
 use crate::error::Error;
+use crate::regex::Transcoding;
 
 /// How many bytes to ask the operating system for at a time.
 const CHUNK: usize = 64 * 1024;
 
 /// Finds the separator of a regex RS: given the buffer and a start offset,
-/// returns the `(start, end)` of the first non-empty match at or after it.
-/// (A trait object so this module needs no regex engine of its own.)
-pub type RegexFinder<'a> = &'a dyn Fn(&[u8], usize) -> Option<(usize, usize)>;
+/// returns the `(start, end)` of the first match at or after it.  The
+/// third argument is the reader's cache for the buffer (see
+/// `Finder::cached`), so work on the whole buffer is done once, not once
+/// per record.  (A trait object so this module needs no regex engine of
+/// its own.)
+pub type RegexFinder<'a> = &'a dyn Fn(&[u8], usize, &mut Transcoding) -> Option<(usize, usize)>;
 
 /// A record source: any byte stream (`Box<dyn Read>` can hold a file, the
 /// standard input or a pipe from a command).
@@ -32,6 +36,10 @@ pub struct RecordReader {
     /// Where the unconsumed part of `buf` starts.
     start: usize,
     eof: bool,
+    /// For a regex RS in UTF-8 mode: the transcoded copy of `buf` that a
+    /// regex matching invalid bytes searches, made once for all records.
+    /// Cleared whenever `buf` changes.
+    trans: Transcoding,
 }
 
 impl RecordReader {
@@ -41,6 +49,7 @@ impl RecordReader {
             buf: Vec::new(),
             start: 0,
             eof: false,
+            trans: Transcoding::default(),
         }
     }
 
@@ -49,6 +58,7 @@ impl RecordReader {
     /// terminal.
     pub fn use_up(&mut self) {
         self.buf.clear();
+        self.trans.clear();
         self.start = 0;
         self.eof = true;
     }
@@ -58,6 +68,7 @@ impl RecordReader {
         if self.eof {
             return Ok(false);
         }
+        self.trans.clear();
         // Drop the consumed part first so the buffer does not grow forever.
         if self.start > 0 {
             self.buf.drain(..self.start);
@@ -133,6 +144,7 @@ impl RecordReader {
         if self.start < self.buf.len() {
             let rec = self.buf[self.start..].to_vec();
             self.buf.clear();
+            self.trans.clear();
             self.start = 0;
             Some(rec)
         } else {
@@ -180,7 +192,7 @@ impl RecordReader {
             return Ok(None);
         }
         let mut pos = self.start;
-        while let Some((s, e)) = find(&self.buf, pos) {
+        while let Some((s, e)) = find(&self.buf, pos, &mut self.trans) {
             if e > s {
                 return Ok(Some(self.take(s, e - s)));
             }
@@ -214,7 +226,7 @@ mod tests {
     #[test]
     fn regex_records_skip_empty_matches() {
         // A finder for "x*": empty matches everywhere, real ones at x runs.
-        let find = |t: &[u8], p: usize| -> Option<(usize, usize)> {
+        let find = |t: &[u8], p: usize, _: &mut Transcoding| -> Option<(usize, usize)> {
             let s = p;
             let e = t[s..].iter().take_while(|&&b| b == b'x').count() + s;
             Some((s, e))
