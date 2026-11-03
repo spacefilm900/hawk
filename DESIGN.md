@@ -424,3 +424,16 @@ These are rejected while parsing, so even code that never runs (`if (0)
   because all three reference awks treat a parenthesised name as a value.
   `x` and `(x)` make the same tree, so `parse_call_args` also records
   whether each argument starts with `(`.
+
+### Other settled items (stage 1)
+
+* `printf` skips C length modifiers (`h`, `l`, `ll`, `L`, `q`, `j`, `z`,
+  `t`): `%ld` is `%d`, `%Lf` is `%f`, as in all three reference awks. With
+  no letter after them (`%l|`) the last modifier is taken as an unknown
+  conversion letter and the text is copied verbatim, as gawk does.
+* Already agreeing with pyawk v1.1, now with tests: `-v NF=3` just sets NF
+  (BEGIN sees 3, the first record recomputes it); very deep nesting is a
+  syntax error with exit status 2; a repeat count above 32767, or a regex
+  needing more than `NFA_LIMIT` automaton states, is a bad regex; `[z-a]`
+  is invalid, `[a-c-e]` reads as mawk does (`a-c`, `-`, `e`) and `a+?` is
+  `(a+)?`.

@@ -104,6 +104,20 @@ fn parse(fmt: &[u8]) -> Vec<Piece<'_>> {
                 spec.prec = Some(digits(fmt, &mut j).unwrap_or(0).min(MAX_WIDTH));
             }
         }
+        // C's "length modifiers" (`h`, `l`, `ll`, `L`, `q`, `j`, `z`, `t`, as
+        // in `%ld`) mean nothing in awk, where every number is a double;
+        // mawk, onetrue-awk and gawk skip them, and so does pyawk v1.1.
+        let mods = j;
+        while j < fmt.len() && b"hlLqjzt".contains(&fmt[j]) {
+            j += 1;
+        }
+        // With no letter after them (`%l|`), the last modifier is itself
+        // the (unknown) conversion letter, so the text is copied verbatim
+        // as gawk does; pyawk's regex gets there by backtracking.
+        let letter_follows = j < fmt.len() && (fmt[j].is_ascii_alphabetic() || fmt[j] == b'%');
+        if !letter_follows && j > mods {
+            j -= 1;
+        }
         if j < fmt.len() && (fmt[j].is_ascii_alphabetic() || fmt[j] == b'%') {
             spec.conv = fmt[j];
             if start > text_start {
@@ -707,6 +721,27 @@ mod tests {
         assert_eq!(f("100%% %5%|%z|%", &[]), "100% %|%z|%");
         assert_eq!(f("%*z|", &[n(3.0)]), "%*z|");
         assert_eq!(f("no conversions", &[n(1.0)]), "no conversions");
+    }
+
+    #[test]
+    fn c_length_modifiers_are_ignored() {
+        assert_eq!(
+            f("%ld %lld %hd %hhd|", &[n(1.0), n(2.0), n(3.0), n(4.0)]),
+            "1 2 3 4|"
+        );
+        assert_eq!(
+            f(
+                "%Lf %zu %jd %qd %td",
+                &[n(4.5), n(5.0), n(6.0), n(7.0), n(8.0)]
+            ),
+            "4.500000 5 6 7 8"
+        );
+        assert_eq!(
+            f("%5.2lf|%-4hs|%lc", &[n(1.23456), s("ab"), n(65.0)]),
+            " 1.23|ab  |A"
+        );
+        // No letter after them: copied as text, like an unknown conversion.
+        assert_eq!(f("%l|%5ll|%lk", &[n(1.0)]), "%l|%5ll|%lk");
     }
 
     #[test]

@@ -411,6 +411,18 @@ mod tests {
     }
 
     #[test]
+    fn posix_corners_settled_by_pyawk_v1_1() {
+        // [a-c-e] is undefined in POSIX; mawk (and pyawk) read a-c, "-", e.
+        assert_eq!(find("[a-c-e]", "d"), None);
+        assert_eq!(find("[a-c-e]", "-"), Some((0, 1)));
+        assert_eq!(find("[a-c-e]", "e"), Some((0, 1)));
+        // a+? is (a+)?, not a lazy a+.
+        assert_eq!(find("^a+?$", ""), Some((0, 0)));
+        assert_eq!(find("^a+?$", "aa"), Some((0, 2)));
+        assert!(Regex::new(b"[z-a]").is_err());
+    }
+
+    #[test]
     fn limits() {
         let e = Regex::new(b"(a{1000}){1001}").err().unwrap().to_string();
         assert!(

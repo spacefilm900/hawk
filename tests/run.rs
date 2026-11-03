@@ -310,3 +310,39 @@ fn next_inside_a_function() {
     assert_eq!(code, 2);
     assert!(e.contains("next called from a function in END"), "{e}");
 }
+
+#[test]
+fn nf_assigned_on_the_command_line() {
+    // `-v NF=3` sets NF before any record; BEGIN sees 3, and reading a
+    // record recomputes it (pyawk v1.1 settled this; it must not crash).
+    assert_eq!(
+        out(
+            &[
+                "-v",
+                "NF=3",
+                "BEGIN { print NF; $0 = \"x y\"; print NF } { print NF; print }"
+            ],
+            "a b\n"
+        ),
+        "3\n2\n2\na b\n"
+    );
+    // An operand assignment is made just before the next file is read.
+    assert_eq!(out(&["{ print NF }", "NF=5", "-"], "a b\n"), "2\n");
+}
+
+#[test]
+fn deep_nesting_is_a_syntax_error() {
+    // Too long for one command-line argument (Linux allows 128 KiB), so
+    // the program goes in a file.
+    let deep = format!(
+        "BEGIN {{ x = {}1{}; print x }}",
+        "(".repeat(200_000),
+        ")".repeat(200_000)
+    );
+    let path = std::env::temp_dir().join(format!("hawk-deep-{}.awk", std::process::id()));
+    std::fs::write(&path, deep).unwrap();
+    let (o, e, rc) = hawk(&["-f", path.to_str().unwrap()], "");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!((o.as_str(), rc), ("", 2));
+    assert!(e.contains("nesting too deep"), "{e}");
+}
