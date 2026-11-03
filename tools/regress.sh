@@ -1,6 +1,7 @@
 #!/bin/sh
 # The full regression, run after every change:
-#   formatting, lints, unit tests, release build, the corpus and the regex check.
+#   formatting, lints, unit tests (Rust and the Python harness), release
+#   build, the corpus and the regex check.
 # Exits non-zero on the first problem.  The corpus runners fail only on a
 # *regression* (a case in tests/corpus/PASSING or REGEX_PASSING that no
 # longer passes); see tools/corpus.py.
@@ -14,6 +15,7 @@ cargo fmt --check
 cargo clippy --quiet --all-targets -- -D warnings
 cargo test --quiet
 cargo build --quiet --release
+python3 tools/test_tools.py
 python3 tools/run_corpus.py "$@"
 python3 tools/regex_check.py "$@"
 # Parser parity with pyawk v1.0 on every corpus program (needs a pyawk

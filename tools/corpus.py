@@ -94,12 +94,24 @@ class Case:
         return p.read_bytes() if p.exists() else None
 
     def extra_env(self) -> dict[str, str]:
-        """Environment variables from ``<name>.environ`` (``NAME=value`` lines)."""
+        """Environment variables from ``<name>.environ`` (``NAME=value`` lines).
+
+        Blank lines are skipped.  A line with no ``=`` or an empty name is
+        an error: read loosely, a stray ``LC_ALL`` would set LC_ALL="" and
+        quietly change the locale the case runs in.
+        """
         p = self.path(".environ")
         if not p.exists():
             return {}
-        pairs = (line.partition("=") for line in p.read_text(encoding="utf-8").splitlines() if line.strip())
-        return {name: value for name, _, value in pairs}
+        result = {}
+        for number, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            name, equals, value = line.partition("=")
+            if not equals or not name:
+                raise ValueError(f"{p}:{number}: not NAME=value: {line!r}")
+            result[name] = value
+        return result
 
     @property
     def locale(self) -> str:

@@ -51,6 +51,7 @@ syntax and runtime errors.
 ```sh
 tools/regress.sh               # the full regression: run it after every change
 cargo test                     # unit tests only
+tools/test_tools.py            # unit tests of the Python harness
 tools/run_corpus.py [-v] [--diff] [CATEGORY | CATEGORY/NAME ...]
 tools/regex_check.py [--show N]
 ```

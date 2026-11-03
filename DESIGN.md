@@ -397,7 +397,10 @@ once hawk has found that prefix.
 * `tools/corpus.py` runs cases as pyawk v1.1's harness does: `utf8` under
   `LC_ALL=C.UTF-8` and the rest under `LC_ALL=C`; `NAME.environ` lines are
   added to the environment (inherited `PYAWK_T_*` variables are dropped
-  first); golden cases run in a temporary copy of their directory.
+  first; a line that is not `NAME=value` is an error, not an empty
+  variable); golden cases run in a temporary copy of their directory.
+  `tools/test_tools.py` unit-tests the harness and runs in
+  `tools/regress.sh`.
 * `tools/regex_check.py` also runs the UTF-8 record. The C table is now a
   hard gate (any disagreeing line fails the run). The UTF-8 table counted
   only regressions until stage 4; it is now a hard gate too (`HARD_GATES`).
