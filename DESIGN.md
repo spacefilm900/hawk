@@ -183,7 +183,8 @@ resolved to slots or cached at load time without changing the interface.
   the depths add up. (Separate chains in one statement are counted
   together too, which is more than needed.) A chain of 4
   million terms used to overflow the 1 GiB stack; now chains past about
-  20,000 terms are a syntax error (about 2,000 on a 2 MiB stack).
+  20,000 terms are "program is nested too deeply", exit status 2 (about
+  2,000 on a 2 MiB stack).
 * **Unknown stack size.** `cli.rs` tells the parser and the interpreter
   how big their stack is. Library callers of `parser::parse` (or an
   interpreter `Config` with `stack_size` 0) do not, so both then assume
@@ -370,7 +371,8 @@ once hawk has found that prefix.
   exits 2, as gawk, mawk and onetrue-awk do.
 * **Deep nesting.** pyawk v1.0 fails (Python's recursion limit) before
   1,000 nested parentheses; hawk accepts up to 5,000 and reports anything
-  deeper as a syntax error. Likewise for operator chains: pyawk v1.0
+  deeper as "program is nested too deeply" (pyawk v1.1's wording; exit
+  status 2). Likewise for operator chains: pyawk v1.0
   fails before 1,000 terms of `1+1+...`, onetrue-awk's parser stack
   before 100,000; hawk takes about 20,000 (gawk and mawk take millions).
   In a regex, nesting is "too deeply nested" past 2,000 levels;

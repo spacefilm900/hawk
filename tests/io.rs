@@ -1,7 +1,7 @@
 //! End-to-end tests for input and output (stage 3 of the v1.1 port):
 //! exit statuses, error reports and signals, which the golden corpus
 //! cannot see because it compares only standard output.  They follow
-//! pyawk v1.1's tests/test_io.py; see DESIGN.md, "I/O (v1.1)".
+//! pyawk v1.1's tests/test_io.py; see DESIGN.md, "I/O (stage 3)".
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
