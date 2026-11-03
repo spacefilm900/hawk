@@ -243,8 +243,8 @@ impl Parser {
 
     /// Run `parse` one level deeper.  Every recursive parsing function goes
     /// through here, so absurdly nested input (a million parentheses, say)
-    /// is a syntax error instead of a stack overflow, which would kill the
-    /// process.  Both the depth and the stack actually used are checked:
+    /// is an error ("program is nested too deeply") instead of a stack
+    /// overflow, which would kill the process.  Both the depth and the stack actually used are checked:
     /// how much stack a level takes depends on the compiler and the build.
     /// `impl FnOnce(&mut Self) -> ...` accepts any function or closure
     /// taking the parser.
@@ -253,7 +253,7 @@ impl Parser {
         // the stack were laid out unexpectedly; the check then just fails.
         let used = self.stack_base.wrapping_sub(stack_position());
         if self.too_deep(used) {
-            return Err(self.error("nesting too deep"));
+            return Err(nested_too_deeply());
         }
         let (depth, links) = (self.depth, self.links);
         self.depth += 1;
@@ -288,7 +288,7 @@ impl Parser {
     fn link(&mut self) -> Result<(), Error> {
         let used = self.stack_base.wrapping_sub(stack_position());
         if self.too_deep(used) {
-            return Err(self.error("nesting too deep"));
+            return Err(nested_too_deeply());
         }
         self.depth += 1;
         self.links += 1;
@@ -1525,6 +1525,14 @@ impl Parser {
     }
 }
 
+/// The error for a program nested past the parser's limit.  It has no
+/// "syntax error at source line N" prefix: the text is not wrong, just too
+/// deep to handle, and pyawk words it the same way ("program is nested too
+/// deeply").
+fn nested_too_deeply() -> Error {
+    Error::Runtime("program is nested too deeply".into())
+}
+
 #[cfg(test)]
 mod tests {
     //! A port of pyawk v1.0's `tests/test_parser.py`, plus extra cases.
@@ -2305,7 +2313,7 @@ mod tests {
 
     #[test]
     fn deep_nesting_is_an_error_not_a_crash() {
-        let too_deep = "syntax error at source line 1: nesting too deep";
+        let too_deep = "program is nested too deeply";
         let n = 100_000;
         let cases = [
             format!("BEGIN {{ x = {}1{} }}", "(".repeat(n), ")".repeat(n)),
@@ -2322,9 +2330,8 @@ mod tests {
         ];
         for src in cases {
             let head: String = src.chars().take(30).collect();
-            // (The message goes on to say which token it was at.)
             let msg = parse_on_small_stack(src).unwrap_or_default();
-            assert!(msg.starts_with(too_deep), "{head}: {msg}");
+            assert_eq!(msg, too_deep, "{head}");
         }
         // Given hawk's big stack, ordinary depths are fine: as many
         // parentheses as gawk accepts, more than mawk and pyawk (which fail
@@ -2359,10 +2366,7 @@ mod tests {
             .join()
             .unwrap()
             .unwrap_or_default();
-        assert!(
-            msg.starts_with("syntax error at source line 1: nesting too deep"),
-            "{msg}"
-        );
+        assert_eq!(msg, "program is nested too deeply");
     }
 
     #[test]
@@ -2392,7 +2396,7 @@ mod tests {
                             assert!(e.contains("expression nesting too deep"), "{e}");
                         }
                     }
-                    Err(e) => assert!(e.to_string().contains("nesting too deep"), "{e}"),
+                    Err(e) => assert_eq!(e.to_string(), "program is nested too deeply"),
                 }
             }
         };
@@ -2413,7 +2417,7 @@ mod tests {
                 }
                 match parse(format!("BEGIN {{ x = {expr} }}").as_bytes()) {
                     Ok(_) => assert!(levels * links <= 2_048, "{levels} x {links} accepted"),
-                    Err(e) => assert!(e.to_string().contains("nesting too deep"), "{e}"),
+                    Err(e) => assert_eq!(e.to_string(), "program is nested too deeply"),
                 }
             }
         };
@@ -2441,7 +2445,7 @@ mod tests {
         // a tree as deep as the chain is long, and the interpreter (and
         // freeing the tree) recurse over that depth.  So chain links count
         // towards the nesting limit as well.
-        let too_deep = "syntax error at source line 1: nesting too deep";
+        let too_deep = "program is nested too deeply";
         let n = 1_000_000;
         let cases = [
             format!("BEGIN {{ x = 1{} }}", "+1".repeat(n)),
@@ -2457,7 +2461,7 @@ mod tests {
         for src in cases {
             let head: String = src.chars().take(30).collect();
             let msg = parse_on_small_stack(src).unwrap_or_default();
-            assert!(msg.starts_with(too_deep), "{head}: {msg}");
+            assert_eq!(msg, too_deep, "{head}");
         }
         // Long but sane chains are fine given hawk's big stack (pyawk fails
         // before 1,000 terms).

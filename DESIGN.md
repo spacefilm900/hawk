@@ -175,7 +175,8 @@ resolved to slots or cached at load time without changing the interface.
   recursive parsing function counts its depth and checks the stack it has
   used (at most half the thread's stack); past 20,100 levels (5,000
   nested parentheses, as many as gawk takes) or the stack budget it stops
-  with "syntax error ...: nesting too deep" instead of overflowing.
+  with "program is nested too deeply" (pyawk's wording; exit status 2)
+  instead of overflowing.
   Operator chains such as `1+1+...+1` are parsed by loops, but build a
   tree as deep as the chain is long, which the interpreter (and freeing
   the tree) recurse over; so each link counts as a level too, and

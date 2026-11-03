@@ -331,7 +331,7 @@ fn nf_assigned_on_the_command_line() {
 }
 
 #[test]
-fn deep_nesting_is_a_syntax_error() {
+fn deep_nesting_is_an_error() {
     // Too long for one command-line argument (Linux allows 128 KiB), so
     // the program goes in a file.
     let deep = format!(
@@ -344,7 +344,7 @@ fn deep_nesting_is_a_syntax_error() {
     let (o, e, rc) = hawk(&["-f", path.to_str().unwrap()], "");
     std::fs::remove_file(&path).unwrap();
     assert_eq!((o.as_str(), rc), ("", 2));
-    assert!(e.contains("nesting too deep"), "{e}");
+    assert_eq!(e, "hawk: program is nested too deeply\n");
 }
 
 #[test]
