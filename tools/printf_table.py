@@ -118,7 +118,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "t.c")
         exe = os.path.join(tmp, "t")
-        Path(src).write_text("\n".join(lines) + "\n")
+        Path(src).write_text("\n".join(lines) + "\n", encoding="utf-8")
         subprocess.run([opts.cc, "-O0", "-w", "-o", exe, src], check=True)
         out = subprocess.run([exe], check=True, capture_output=True).stdout
     OUT.parent.mkdir(parents=True, exist_ok=True)

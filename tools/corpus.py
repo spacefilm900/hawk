@@ -83,11 +83,11 @@ class Case:
 
     def extra_args(self) -> list[str]:
         p = self.path(".args")
-        return shlex.split(p.read_text()) if p.exists() else []
+        return shlex.split(p.read_text(encoding="utf-8")) if p.exists() else []
 
     def operands(self) -> list[str]:
         p = self.path(".operands")
-        return shlex.split(p.read_text()) if p.exists() else [f"{self.name}.in"]
+        return shlex.split(p.read_text(encoding="utf-8")) if p.exists() else [f"{self.name}.in"]
 
     def stdin_data(self) -> bytes | None:
         p = self.path(".stdin")
@@ -98,7 +98,7 @@ class Case:
         p = self.path(".environ")
         if not p.exists():
             return {}
-        pairs = (line.partition("=") for line in p.read_text().splitlines() if line.strip())
+        pairs = (line.partition("=") for line in p.read_text(encoding="utf-8").splitlines() if line.strip())
         return {name: value for name, _, value in pairs}
 
     @property
@@ -128,7 +128,7 @@ def read_manifest(directory: Path) -> dict[str, tuple[str, str]]:
     result: dict[str, tuple[str, str]] = {}
     if not p.exists():
         return result
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#") or line.startswith("name\t"):
             continue
         name, status, reason, *_rest = line.split("\t")
@@ -185,7 +185,7 @@ def _run(case: Case, awk: list[str], cwd: Path, env: dict[str, str],
 def read_passing(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    return {ln.partition("#")[0].strip() for ln in path.read_text().splitlines()} - {""}
+    return {ln.partition("#")[0].strip() for ln in path.read_text(encoding="utf-8").splitlines()} - {""}
 
 
 def write_passing(path: Path, ids: set[str], what: str) -> None:

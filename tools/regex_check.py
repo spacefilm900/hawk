@@ -94,7 +94,7 @@ def main() -> int:
             return 2
         awk[0] = str(Path(awk[0]).resolve())
 
-    records = json.loads(RECORD.read_text())["records"] + json.loads(RECORD_UTF8.read_text())["records"]
+    records = json.loads(RECORD.read_text(encoding="utf-8"))["records"] + json.loads(RECORD_UTF8.read_text(encoding="utf-8"))["records"]
 
     def check(rec: dict) -> tuple[dict, list[tuple[str, str, str]]]:
         got = run_probe(awk, rec)
