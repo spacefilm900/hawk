@@ -111,4 +111,4 @@ skips it).
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT, copyright (c) 2026 Keith Haviland; see [LICENSE](LICENSE).
