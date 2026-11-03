@@ -193,6 +193,12 @@ impl Io {
         }
         if !self.inputs.contains_key(name) {
             let f = File::open(OsStr::from_bytes(name)).ok()?;
+            // A directory opens, but reading it fails: treat it as a file
+            // that cannot be read, so getline returns -1 (pyawk, whose
+            // open() refuses directories; gawk and mawk also give -1).
+            if f.metadata().is_ok_and(|m| m.is_dir()) {
+                return None;
+            }
             let input = Input {
                 reader: RecordReader::new(Box::new(f)),
                 child: None,

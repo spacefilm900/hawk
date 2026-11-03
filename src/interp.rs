@@ -1401,14 +1401,12 @@ impl<'p> Interp<'p> {
                 } else {
                     self.io.input_cmd(&name)?.read_record(&rs, finder)?
                 };
+                // NR and FNR are left alone by both forms: mawk, onetrue-awk
+                // and gawk agree, although POSIX says `cmd | getline`
+                // increments NR (pyawk v1.1 follows the three awks).
                 match got {
                     None => return Ok(Value::Num(0.0)),
-                    Some(r) => {
-                        if kind == GetlineKind::Cmd {
-                            self.bump("NR");
-                        }
-                        r
-                    }
+                    Some(r) => r,
                 }
             }
         };

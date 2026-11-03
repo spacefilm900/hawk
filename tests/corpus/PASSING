@@ -265,7 +265,9 @@ gawk/zeroflag
 io/close_status
 io/close_values
 io/getline_begin
+io/getline_cmd
 io/getline_dev_stdin
+io/getline_file
 io/getline_main
 io/getline_stdin
 io/pipe_getline_concat
