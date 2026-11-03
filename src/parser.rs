@@ -1384,7 +1384,7 @@ impl Parser {
             }
             Tok::FuncName(name) => {
                 self.advance();
-                let args = self.parse_call_args()?;
+                let args = self.parse_call_args(None)?;
                 self.calls.push((name.clone(), args.len(), line));
                 Ok(Expr::UserCall(name, args))
             }
@@ -1413,7 +1413,7 @@ impl Parser {
     }
 
     fn parse_builtin(&mut self, b: Builtin) -> Result<Expr, Error> {
-        self.advance();
+        let line = self.advance().line;
         if !self.at(&Tok::LParen) {
             // `length` without parentheses means length($0).
             if b == Builtin::Length {
@@ -1421,18 +1421,81 @@ impl Parser {
             }
             return Err(self.error(&format!("expected '(' after {}", b.name())));
         }
-        Ok(Expr::Call(b, self.parse_call_args()?))
+        let mut parenthesised = Vec::new();
+        let args = self.parse_call_args(Some(&mut parenthesised))?;
+        // A wrong number of arguments is a syntax error, even in code that
+        // never runs (mawk and gawk; onetrue-awk for most builtins).
+        let (lo, hi) = b.arity();
+        if !(lo..=hi).contains(&args.len()) {
+            let want = if lo == hi {
+                lo.to_string()
+            } else if hi == usize::MAX {
+                format!("at least {lo}")
+            } else {
+                format!("{lo} to {hi}")
+            };
+            let msg = format!(
+                "function {} called with {} args (takes {want})",
+                b.name(),
+                args.len()
+            );
+            return Err(Error::syntax(msg, line));
+        }
+        // split's array must be a plain name.  mawk and onetrue-awk reject
+        // anything else while parsing (gawk only when it runs).  `(a)` makes
+        // the same tree as `a`, hence the separate `parenthesised` record.
+        if b == Builtin::Split && !(matches!(args[1], Expr::Var(_)) && !parenthesised[1]) {
+            return Err(Error::syntax(
+                "split: second argument must be an array name",
+                line,
+            ));
+        }
+        // sub/gsub assign to their target, so it must be a variable, an
+        // element or a field.  POSIX leaves anything else undefined; mawk and
+        // onetrue-awk reject it while parsing.  `(x)` is a value, not a
+        // variable, in all three reference awks.
+        if matches!(b, Builtin::Sub | Builtin::Gsub)
+            && args.len() == 3
+            && (!args[2].is_lvalue() || parenthesised[2])
+        {
+            let msg = format!(
+                "{}: third argument must be a variable, element or field",
+                b.name()
+            );
+            return Err(Error::syntax(msg, line));
+        }
+        Ok(Expr::Call(b, args))
     }
 
     /// `( [expr, expr, ...] )` after a builtin or user function name.
     /// Inside, `>` compares again, and newlines may follow the commas.
-    fn parse_call_args(&mut self) -> Result<Vec<Expr>, Error> {
+    ///
+    /// If `parenthesised` is given (`Some`), one entry per argument is
+    /// pushed onto it: whether that argument starts with `(`.  `&mut
+    /// Vec<bool>` is a borrowed vector the function may add to; the
+    /// `Option` makes it optional, like Python's `starts=None`.
+    fn parse_call_args(
+        &mut self,
+        mut parenthesised: Option<&mut Vec<bool>>,
+    ) -> Result<Vec<Expr>, Error> {
         self.expect(&Tok::LParen)?;
         let args = self.with_no_gt(false, |p| -> Result<Vec<Expr>, Error> {
             p.skip_newlines();
             let mut args = Vec::new();
             if !p.at(&Tok::RParen) {
-                args = p.parse_expr_list()?;
+                loop {
+                    // `as_deref_mut` lends out the vector inside the
+                    // Option without giving it away, so the loop can use
+                    // it again next time round.
+                    if let Some(starts) = parenthesised.as_deref_mut() {
+                        starts.push(p.at(&Tok::LParen));
+                    }
+                    args.push(p.parse_expr()?);
+                    if !p.accept(&Tok::Comma) {
+                        break;
+                    }
+                    p.skip_newlines();
+                }
             }
             p.skip_newlines();
             p.expect(&Tok::RParen)?;
@@ -1866,6 +1929,141 @@ mod tests {
         // gawk agrees (a call from BEGIN/END is a run-time error).
         let prog = p("function f() { next } { f() }");
         assert_eq!(prog.functions[0].body, vec![Stmt::Next]);
+    }
+
+    #[test]
+    fn builtin_argument_count_is_checked_when_parsing() {
+        // mawk and gawk reject these while parsing, even in code that never
+        // runs; onetrue-awk does for most (it only warns for `length(1, 2)`,
+        // `rand(1)` and the like).
+        for (call, want) in [
+            (
+                "substr(\"a\")",
+                "function substr called with 1 args (takes 2 to 3)",
+            ),
+            (
+                "substr(\"a\", 1, 2, 3)",
+                "function substr called with 4 args (takes 2 to 3)",
+            ),
+            ("index(1)", "function index called with 1 args (takes 2)"),
+            (
+                "split(\"a\")",
+                "function split called with 1 args (takes 2 to 3)",
+            ),
+            (
+                "split(\"a\", b, \" \", 4)",
+                "function split called with 4 args",
+            ),
+            ("sub(/a/)", "function sub called with 1 args"),
+            ("gsub(/a/, \"b\", x, 4)", "function gsub called with 4 args"),
+            ("match(1)", "function match called with 1 args (takes 2)"),
+            // gawk's three-argument match is an extension
+            (
+                "match(\"a\", /a/, m)",
+                "function match called with 3 args (takes 2)",
+            ),
+            (
+                "length(1, 2)",
+                "function length called with 2 args (takes 0 to 1)",
+            ),
+            ("sin()", "function sin called with 0 args (takes 1)"),
+            ("cos(1, 2)", "function cos called with 2 args"),
+            ("exp()", "function exp called with 0 args"),
+            ("log()", "function log called with 0 args"),
+            ("sqrt(1, 2)", "function sqrt called with 2 args"),
+            ("int()", "function int called with 0 args"),
+            ("atan2(1)", "function atan2 called with 1 args (takes 2)"),
+            ("rand(1)", "function rand called with 1 args (takes 0)"),
+            (
+                "srand(1, 2)",
+                "function srand called with 2 args (takes 0 to 1)",
+            ),
+            ("tolower()", "function tolower called with 0 args"),
+            ("toupper(1, 2)", "function toupper called with 2 args"),
+            ("system()", "function system called with 0 args"),
+            ("close()", "function close called with 0 args (takes 1)"),
+            // gawk's two-argument close is an extension
+            (
+                "close(\"a\", \"b\")",
+                "function close called with 2 args (takes 1)",
+            ),
+            (
+                "fflush(1, 2)",
+                "function fflush called with 2 args (takes 0 to 1)",
+            ),
+            (
+                "sprintf()",
+                "function sprintf called with 0 args (takes at least 1)",
+            ),
+        ] {
+            let msg = err(&format!("BEGIN {{ if (0) x = {call} }}"));
+            assert!(msg.contains(want), "{call}: {msg}");
+        }
+    }
+
+    #[test]
+    fn builtin_argument_counts_that_are_allowed() {
+        for call in [
+            "length",
+            "length()",
+            "length(1)",
+            "substr(\"a\", 1)",
+            "substr(\"a\", 1, 2)",
+            "split(\"a\", b)",
+            "split(\"a\", b, \" \")",
+            "sub(/a/, \"b\")",
+            "gsub(/a/, \"b\", x)",
+            "rand()",
+            "srand()",
+            "srand(1)",
+            "fflush()",
+            "fflush(\"a\")",
+            "sprintf(\"a\")",
+            "sprintf(\"%s %s\", 1, 2)",
+        ] {
+            p(&format!("BEGIN {{ x = {call} }}"));
+        }
+    }
+
+    #[test]
+    fn split_target_must_be_a_name() {
+        // mawk and onetrue-awk reject anything else while parsing (gawk
+        // only when it runs).
+        for arg in ["3", "x[1]", "$1", "(a)", "a b", "f()"] {
+            let src = format!("function f() {{ }} BEGIN {{ if (0) split(\"a b\", {arg}) }}");
+            let msg = err(&src);
+            assert!(
+                msg.contains("split: second argument must be an array name"),
+                "{arg}: {msg}"
+            );
+        }
+        p("function g(arr) { return split(\"a b\", arr) } BEGIN { n = split(\"a\", a) }");
+    }
+
+    #[test]
+    fn sub_target_must_be_an_lvalue() {
+        // POSIX leaves anything else undefined; mawk and onetrue-awk reject
+        // it while parsing; gawk accepts a literal or a sum.  `(x)` is a
+        // value in all three, so the parentheses count.
+        for f in ["sub", "gsub"] {
+            for arg in [
+                "\"c\"", "1 + 2", "x y", "(x)", "($1)", "length", "x++", "$x++", "f()",
+            ] {
+                let src = format!("function f() {{ }} BEGIN {{ if (0) {f}(/a/, \"b\", {arg}) }}");
+                let msg = err(&src);
+                let want = format!("{f}: third argument must be a variable, element or field");
+                assert!(msg.contains(&want), "{f} {arg}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn sub_targets_that_are_allowed() {
+        for arg in ["x", "x[1]", "x[1, 2]", "$1", "$(1)", "$NF", "$++x"] {
+            p(&format!(
+                "BEGIN {{ sub(/a/, \"b\", {arg}); gsub(/a/, \"b\", {arg}) }}"
+            ));
+        }
     }
 
     #[test]

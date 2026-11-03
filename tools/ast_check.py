@@ -44,8 +44,6 @@ DELIBERATE: set[str] = set()
 # up yet (the v1.1 port in progress on branch ``enhancements``).  They are
 # listed, not counted as failures; each stage empties its part.
 PENDING = {
-    # stage 1: builtin argument counts (3-argument match)
-    "gawk/rebrackloc.awk",
     # stage 2: nextfile
     "golden/nextfile/assignment_operands.awk",
     "golden/nextfile/first_lines.awk",

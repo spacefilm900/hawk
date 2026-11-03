@@ -116,6 +116,22 @@ pub enum Builtin {
 }
 
 impl Builtin {
+    /// How many arguments the builtin takes: `(fewest, most)`.  `sprintf`
+    /// has no upper limit, written as `usize::MAX` (the largest number a
+    /// `usize` can hold).  The parser rejects any other count (pyawk v1.1,
+    /// mawk, gawk).
+    pub fn arity(self) -> (usize, usize) {
+        use Builtin::*;
+        match self {
+            Length | Srand | Fflush => (0, 1),
+            Rand => (0, 0),
+            Substr | Split | Sub | Gsub => (2, 3),
+            Index | Match | Atan2 => (2, 2),
+            Sprintf => (1, usize::MAX),
+            Sin | Cos | Exp | Log | Sqrt | Int | Tolower | Toupper | System | Close => (1, 1),
+        }
+    }
+
     /// The builtin's AWK name.
     pub fn name(self) -> &'static str {
         use Builtin::*;

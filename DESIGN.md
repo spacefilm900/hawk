@@ -405,3 +405,22 @@ once hawk has found that prefix.
   `PENDING` and reported, not failed. `tools/ast_dump.py` now decodes the
   program as Latin-1, as pyawk v1.1 does in the C locale, so a string
   escape such as `"\303"` dumps as the single byte it stands for.
+
+### Parse-time errors (stage 1)
+
+These are rejected while parsing, so even code that never runs (`if (0)
+...`) makes the program fail with exit status 2, as in mawk and gawk:
+
+* `next` written in a BEGIN or END action ("next used in BEGIN action").
+  `next` inside a function body is allowed (POSIX, gawk); if such a
+  function is called from BEGIN or END the run stops with "next called
+  from a function in BEGIN" (see "Errors" above for `Unwind::Next`).
+* A builtin called with the wrong number of arguments: "function substr
+  called with 1 args (takes 2 to 3)". The counts live in
+  `Builtin::arity` in `src/lexer.rs`; gawk's extensions (`match` with an
+  array, `close` with "to"/"from") count as wrong.
+* `split`'s second argument must be a plain name, and `sub`/`gsub`'s third
+  must be a variable, element or field. `(x)` is rejected in both places,
+  because all three reference awks treat a parenthesised name as a value.
+  `x` and `(x)` make the same tree, so `parse_call_args` also records
+  whether each argument starts with `(`.
