@@ -65,7 +65,7 @@ tools/regex_check.py [--show N]
   This table is a hard gate: every line must agree.
 * `tests/corpus/regex_differential_utf8.json` does the same for 88 patterns
   on UTF-8 text (2,152 lines, onetrue-awk and `gawk --posix` under
-  `LC_ALL=C.UTF-8`).
+  `LC_ALL=C.UTF-8`). Also a hard gate.
 
 How the runners judge progress: `tests/corpus/PASSING` and `REGEX_PASSING`
 list the cases hawk passed last time. A run fails only if one of those cases

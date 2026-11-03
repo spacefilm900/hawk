@@ -2,6 +2,7 @@
 //! for `&` in replacements and for empty matches.  (The matching itself is
 //! in `regex/`.)
 
+use crate::charset;
 use crate::regex::{Finder, Regex};
 
 /// One piece of a parsed replacement string.
@@ -65,7 +66,7 @@ pub fn expand_replacement(repl: &[u8]) -> Vec<Part> {
 
 /// sub()/gsub() core with AWK's empty-match rules; returns the new text
 /// and the number of replacements.  An empty match is replaced and then
-/// one byte copied so the scan moves on, and an empty match right after
+/// one character copied so the scan moves on, and an empty match right after
 /// a non-empty one is skipped: `gsub(/x*/, "-", "abxd")` gives `-a-b-d-`.
 pub fn substitute(re: &Regex, repl: &[u8], s: &[u8], global: bool) -> (Vec<u8>, usize) {
     let parts = expand_replacement(repl);
@@ -84,8 +85,9 @@ pub fn substitute(re: &Regex, repl: &[u8], s: &[u8], global: bool) -> (Vec<u8>, 
             if st >= n {
                 break;
             }
-            out.extend_from_slice(&s[i..=st]);
-            i = st + 1;
+            let next = charset::next(s, st, re.utf8());
+            out.extend_from_slice(&s[i..next]);
+            i = next;
             continue;
         }
         out.extend_from_slice(&s[i..st]);
@@ -97,10 +99,9 @@ pub fn substitute(re: &Regex, repl: &[u8], s: &[u8], global: bool) -> (Vec<u8>, 
         }
         count += 1;
         if st == en {
-            if st < n {
-                out.push(s[st]);
-            }
-            i = st + 1;
+            let next = charset::next(s, st, re.utf8());
+            out.extend_from_slice(&s[st..next.min(n)]);
+            i = next;
         } else {
             i = en;
             last_end = Some(en);
@@ -130,7 +131,7 @@ pub fn split_regex(re: &Regex, s: &[u8]) -> Vec<Vec<u8>> {
             break;
         };
         if st == en {
-            pos = st + 1;
+            pos = charset::next(s, st, re.utf8());
             continue;
         }
         pieces.push(s[piece_start..st].to_vec());

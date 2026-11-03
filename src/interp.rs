@@ -631,7 +631,7 @@ impl<'p> Interp<'p> {
         if let Some(re) = self.regexes.get(src) {
             return Ok(re.clone());
         }
-        let re = Rc::new(Regex::new(src)?);
+        let re = Rc::new(Regex::with_mode(src, self.utf8)?);
         if self.regexes.len() >= REGEX_CACHE_ENTRIES || self.regex_states + re.size() > NFA_LIMIT {
             self.regexes.clear();
             self.regex_states = 0;

@@ -95,3 +95,51 @@ fn printf_counts_characters_and_c_writes_code_points() {
         b"[ \xc3\xa9][A]"
     );
 }
+
+#[test]
+fn regexes_match_characters() {
+    // `.` is one character; a repeat repeats the whole character.
+    assert_eq!(u("{ gsub(/./, \"[&]\"); print }", "aé\n"), "[a][é]\n");
+    assert_eq!(
+        u("{ print match($0, /é+/), RSTART, RLENGTH }", "aééb\n"),
+        "2 2 2\n"
+    );
+    // Classes use the Unicode tables; [=é=] is only é.
+    assert_eq!(
+        u("{ gsub(/[[:alpha:]]/, \"A\"); print }", "é1ß-\n"),
+        "A1A-\n"
+    );
+    assert_eq!(u("{ gsub(/[[=e=]]/, \"E\"); print }", "eé\n"), "Eé\n");
+    assert_eq!(u("{ gsub(/[[=é=]]/, \"E\"); print }", "eé\n"), "eE\n");
+    // Escapes that spell a character are that character.
+    assert_eq!(u("{ gsub(/\\303\\251/, \"E\"); print }", "aé\n"), "aE\n");
+    // An empty match moves on by a whole character.
+    assert_eq!(u("{ gsub(/x*/, \"-\"); print }", "aé\n"), "-a-é-\n");
+    // A regex FS made of one multibyte character, and split on "".
+    assert_eq!(
+        u("BEGIN { FS = \"é\" } { print $2, NF }", "aébéc\n"),
+        "b 3\n"
+    );
+    assert_eq!(
+        u(
+            "{ n = split($0, a, /[éb]/); print n, a[1] a[2] a[3] }",
+            "aébc\n"
+        ),
+        "3 ac\n"
+    );
+}
+
+#[test]
+fn invalid_bytes_match_only_themselves() {
+    let prog = "{ gsub(/[^a]/, \"<&>\"); print }";
+    assert_eq!(run_in("C.UTF-8", prog, b"a\xe9b\n"), b"a\xe9<b>\n");
+    let prog = "{ gsub(/\\351/, \"#\"); print }";
+    assert_eq!(
+        run_in("C.UTF-8", prog, b"\xe9\xc3\xa9\n"),
+        "#é\n".as_bytes()
+    );
+    let prog = "{ print match($0, /b./), RSTART, RLENGTH }";
+    assert_eq!(run_in("C.UTF-8", prog, b"b\xe9b\xc3\xa9\n"), b"3 3 2\n");
+    // The C locale: every byte is a character.
+    assert_eq!(run_in("C", prog, b"b\xe9b\xc3\xa9\n"), b"1 1 2\n");
+}

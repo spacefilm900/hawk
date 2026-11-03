@@ -16,11 +16,29 @@
 //! * Escapes: `\n \t \r \f \v \a \b`, octal `\ddd`, hex `\xhh`; any other
 //!   escaped byte is itself, and a trailing `\` is a literal backslash.
 //!
-//! UTF-8 seam: everything here works on *bytes* and a bracket expression
-//! becomes a [`ByteSet`].  A later UTF-8 mode would parse code points and
-//! turn each code-point set into an alternation of UTF-8 byte sequences, so
-//! the automata in `nfa.rs` and `dfa.rs` could stay byte-based unchanged.
+//! In the C locale every byte is a character and a bracket expression
+//! becomes a [`ByteSet`].
+//!
+//! UTF-8 mode (pyawk v1.1's rules): the pattern is read as characters, and
+//! every set of characters (`.`, a bracket, a class, a literal) is a list of
+//! code-point ranges, which [`utf8_node`] turns into an alternation of
+//! UTF-8 byte sequences.  So the automata in `nfa.rs` and `dfa.rs` stay
+//! byte-based, unchanged, and C mode does not pay for UTF-8 at all.
+//!
+//! * An invalid byte b in the pattern, or an octal/hex escape for a byte
+//!   of 0x80 or more that does not join the escapes after it into a valid
+//!   character, stands for the *escaped byte* U+DC00+b (see `charset`),
+//!   which matches only that invalid byte in the text.  `\303\251` is `é`.
+//! * `.` and `[^...]` match any character but never an invalid byte.
+//! * `[:class:]` uses gawk's Unicode tables; `[=x=]` and `[.x.]` hold one
+//!   character, which is only equivalent to itself.
+//!
+//! The escaped bytes are encoded as if they were ordinary code points
+//! (U+DC80..U+DCFF, `ED B2 80`..`ED B3 BF`); a pattern that can match one
+//! is *raw* ([`Parsed::raw`]) and is run on a copy of the text with each
+//! invalid byte written that way (see `regex/mod.rs`).
 
+use crate::charset;
 use crate::error::Error;
 
 /// Largest repeat count in an interval (POSIX's RE_DUP_MAX).
@@ -101,16 +119,33 @@ pub enum Node {
     Empty,
 }
 
-/// Parse `src`; errors read `bad regular expression /src/: why`.
+/// A parsed pattern.
+pub struct Parsed {
+    pub node: Node,
+    /// UTF-8 mode: the pattern can match an invalid byte (an escaped byte
+    /// U+DC80..U+DCFF), so the text must be transcoded before matching.
+    pub raw: bool,
+}
+
+/// Parse `src` in the C locale; errors read `bad regular expression
+/// /src/: why`.
+#[cfg(test)]
 pub fn parse(src: &[u8]) -> Result<Node, Error> {
+    parse_mode(src, false).map(|p| p.node)
+}
+
+/// Parse `src`, as characters if `utf8`.
+pub fn parse_mode(src: &[u8], utf8: bool) -> Result<Parsed, Error> {
     let mut p = Parser {
         s: src,
         i: 0,
         depth: 0,
+        utf8,
+        raw: false,
     };
     let r = p.alt();
     match r {
-        Ok((node, _)) if p.i == src.len() => Ok(node),
+        Ok((node, _)) if p.i == src.len() => Ok(Parsed { node, raw: p.raw }),
         // Only an unmatched `)` at depth 0 could stop `alt` early, and that
         // is a literal, so this cannot happen; be safe anyway.
         Ok(_) => Err(bad(src, "unexpected )")),
@@ -125,37 +160,217 @@ fn bad(src: &[u8], why: &str) -> Error {
     ))
 }
 
-/// The POSIX character class `[:name:]`, or None if unknown.
-fn class(name: &[u8]) -> Option<ByteSet> {
-    let mut s = ByteSet::default();
-    let mut add = |ranges: &[(u8, u8)]| {
-        for &(lo, hi) in ranges {
-            s.insert_range(lo, hi);
-        }
-    };
-    match name {
-        b"alpha" => add(&[(b'a', b'z'), (b'A', b'Z')]),
-        b"digit" => add(&[(b'0', b'9')]),
-        b"alnum" => add(&[(b'a', b'z'), (b'A', b'Z'), (b'0', b'9')]),
-        b"upper" => add(&[(b'A', b'Z')]),
-        b"lower" => add(&[(b'a', b'z')]),
+/// The POSIX character class `[:name:]` in the C locale as byte ranges,
+/// or None if unknown.
+fn class(name: &[u8]) -> Option<&'static [(u32, u32)]> {
+    Some(match name {
+        b"alpha" => &[(0x61, 0x7A), (0x41, 0x5A)], // a-z A-Z
+        b"digit" => &[(0x30, 0x39)],
+        b"alnum" => &[(0x61, 0x7A), (0x41, 0x5A), (0x30, 0x39)],
+        b"upper" => &[(0x41, 0x5A)],
+        b"lower" => &[(0x61, 0x7A)],
         // space: " \t\n\r\f\v" (tab..carriage return is 9..13).
-        b"space" => add(&[(b' ', b' '), (9, 13)]),
-        b"blank" => add(&[(b' ', b' '), (b'\t', b'\t')]),
-        b"punct" => add(&[(b'!', b'/'), (b':', b'@'), (b'[', b'`'), (b'{', b'~')]),
-        b"xdigit" => add(&[(b'0', b'9'), (b'a', b'f'), (b'A', b'F')]),
-        b"cntrl" => add(&[(0, 31), (127, 127)]),
-        b"print" => add(&[(32, 126)]),
-        b"graph" => add(&[(33, 126)]),
+        b"space" => &[(0x20, 0x20), (9, 13)],
+        b"blank" => &[(0x20, 0x20), (9, 9)],
+        b"punct" => &[(0x21, 0x2F), (0x3A, 0x40), (0x5B, 0x60), (0x7B, 0x7E)],
+        b"xdigit" => &[(0x30, 0x39), (0x61, 0x66), (0x41, 0x46)],
+        b"cntrl" => &[(0, 31), (127, 127)],
+        b"print" => &[(32, 126)],
+        b"graph" => &[(33, 126)],
         _ => return None,
+    })
+}
+
+/// The escaped bytes, U+DC80..U+DCFF: what invalid bytes are in a pattern.
+const ESCAPED: (u32, u32) = (charset::ESCAPED_BASE + 0x80, charset::ESCAPED_BASE + 0xFF);
+
+/// Sort and merge overlapping or touching ranges.
+fn merge(mut r: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    r.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(r.len());
+    for (lo, hi) in r {
+        match out.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
     }
-    Some(s)
+    out
+}
+
+/// The ranges of `r` (merged) minus the range `(lo, hi)`.
+fn subtract(r: &[(u32, u32)], (lo, hi): (u32, u32)) -> Vec<(u32, u32)> {
+    let mut out = Vec::with_capacity(r.len() + 1);
+    for &(a, b) in r {
+        if b < lo || a > hi {
+            out.push((a, b));
+            continue;
+        }
+        if a < lo {
+            out.push((a, lo - 1));
+        }
+        if b > hi {
+            out.push((hi + 1, b));
+        }
+    }
+    out
+}
+
+/// The complement of merged ranges within 0..=0x10FFFF.
+fn complement(r: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut next = 0;
+    for &(a, b) in r {
+        if a > next {
+            out.push((next, a - 1));
+        }
+        next = b + 1;
+    }
+    if next <= 0x10FFFF {
+        out.push((next, 0x10FFFF));
+    }
+    out
+}
+
+/// The UTF-8 byte-range sequences for the code points lo..=hi (both
+/// 0x80 or more): each sequence is a list of byte ranges, one per byte,
+/// and the sequences together match exactly the encodings of lo..=hi.
+/// This is the standard split (as in RE2 and Rust's regex crate): cut the
+/// range where the encoded length changes, then where the bytes after
+/// the first stop covering the full 80..BF, until each piece is a simple
+/// product of byte ranges.  Surrogates get the plain UTF-8 bit layout;
+/// the callers only let the escaped bytes through.
+fn utf8_sequences(lo: u32, hi: u32, out: &mut Vec<Vec<(u8, u8)>>) {
+    let mut todo = vec![(lo, hi)];
+    // `'piece: loop` is a labelled loop; `continue 'piece` restarts it.
+    while let Some((s, mut e)) = todo.pop() {
+        'piece: loop {
+            for max in [0x7F, 0x7FF, 0xFFFF] {
+                if s <= max && max < e {
+                    todo.push((max + 1, e));
+                    e = max;
+                    continue 'piece;
+                }
+            }
+            for i in 1..4 {
+                let m = (1u32 << (6 * i)) - 1;
+                if s & !m != e & !m {
+                    if s & m != 0 {
+                        todo.push(((s | m) + 1, e));
+                        e = s | m;
+                        continue 'piece;
+                    }
+                    if e & m != m {
+                        todo.push((e & !m, e));
+                        e = (e & !m) - 1;
+                        continue 'piece;
+                    }
+                }
+            }
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            charset::utf8_bytes(s, &mut a);
+            charset::utf8_bytes(e, &mut b);
+            out.push(a.into_iter().zip(b).collect());
+            break;
+        }
+    }
+}
+
+/// Byte ranges as a ByteSet.
+fn byte_set(r: &[(u32, u32)]) -> ByteSet {
+    let mut set = ByteSet::default();
+    for &(lo, hi) in r {
+        if lo <= 0xFF {
+            set.insert_range(lo as u8, hi.min(0xFF) as u8);
+        }
+    }
+    set
+}
+
+/// The node matching one character from the merged code-point ranges `r`
+/// (UTF-8 mode).  ASCII is one byte set; the rest is a trie of byte-range
+/// sequences, so sequences that share their first bytes share those
+/// states: `[éè]` is `C3 (A8|A9)`, not `C3 A8 | C3 A9`.
+pub fn utf8_node(r: &[(u32, u32)]) -> Node {
+    let mut seqs: Vec<Vec<(u8, u8)>> = Vec::new();
+    let ascii: Vec<(u32, u32)> = r
+        .iter()
+        .filter(|&&(lo, _)| lo < 0x80)
+        .map(|&(lo, hi)| (lo, hi.min(0x7F)))
+        .collect();
+    for &(lo, hi) in r {
+        if hi >= 0x80 {
+            utf8_sequences(lo.max(0x80), hi, &mut seqs);
+        }
+    }
+    let mut branches = Vec::new();
+    if !ascii.is_empty() {
+        branches.push(Node::Set(byte_set(&ascii)));
+    }
+    trie(&seqs, &mut branches);
+    alt_of(branches)
+}
+
+/// Append the alternatives for `seqs` (sorted, all non-empty): one per
+/// distinct first byte range, followed by the trie of what comes after.
+fn trie(seqs: &[Vec<(u8, u8)>], out: &mut Vec<Node>) {
+    let mut leaves = ByteSet::default();
+    let mut any_leaf = false;
+    let mut i = 0;
+    while i < seqs.len() {
+        let head = seqs[i][0];
+        let mut j = i;
+        while j < seqs.len() && seqs[j][0] == head {
+            j += 1;
+        }
+        let set = Node::Set(byte_set(&[(head.0 as u32, head.1 as u32)]));
+        let rest: Vec<Vec<(u8, u8)>> = seqs[i..j]
+            .iter()
+            .filter(|s| s.len() > 1)
+            .map(|s| s[1..].to_vec())
+            .collect();
+        if rest.is_empty() {
+            // Single-byte alternatives merge into one set.
+            leaves.union(&byte_set(&[(head.0 as u32, head.1 as u32)]));
+            any_leaf = true;
+        } else {
+            let mut tail = Vec::new();
+            trie(&rest, &mut tail);
+            let mut items = vec![set];
+            match alt_of(tail) {
+                Node::Cat(more) => items.extend(more),
+                other => items.push(other),
+            }
+            out.push(Node::Cat(items));
+        }
+        i = j;
+    }
+    if any_leaf {
+        out.push(Node::Set(leaves));
+    }
+}
+
+fn alt_of(mut branches: Vec<Node>) -> Node {
+    match branches.len() {
+        0 => Node::Set(ByteSet::default()), // matches nothing
+        1 => branches.pop().unwrap(),
+        _ => Node::Alt(branches),
+    }
+}
+
+/// How tall (see [`Tree`]) a node built by [`utf8_node`] is.
+fn height(node: &Node) -> u32 {
+    match node {
+        Node::Cat(v) | Node::Alt(v) => 1 + v.iter().map(height).max().unwrap_or(0),
+        Node::Repeat(x, ..) => 1 + height(x),
+        _ => 1,
+    }
 }
 
 /// What a bracket element turned out to be.
 enum Elem {
-    Byte(u8),
-    Class(ByteSet),
+    /// One character: a byte in C mode, a code point in UTF-8 mode.
+    Char(u32),
+    Class(Vec<(u32, u32)>),
 }
 
 /// Parser state.  Errors are plain `String` reasons here; [`parse`] wraps
@@ -164,6 +379,10 @@ struct Parser<'a> {
     s: &'a [u8],
     i: usize,
     depth: u32,
+    /// Read the pattern as UTF-8 characters.
+    utf8: bool,
+    /// Some set can match an escaped byte (see [`Parsed::raw`]).
+    raw: bool,
 }
 
 /// `Result<T, String>`: either a value or an error reason.
@@ -235,7 +454,12 @@ impl Parser<'_> {
             }
             if let Some(atom) = self.atom()? {
                 let (node, h) = self.postfix(atom)?;
-                items.push(node);
+                // A multibyte character is a Cat of bytes: splice it in, so
+                // `é` in `aéb` is a plain literal (see `literal_of`).
+                match node {
+                    Node::Cat(more) => items.extend(more),
+                    node => items.push(node),
+                }
                 height = height.max(h);
             }
         }
@@ -289,22 +513,43 @@ impl Parser<'_> {
                 self.i += 1;
                 leaf(Node::Eol)
             }
-            b'.' => {
+            b'.' if !self.utf8 => {
                 self.i += 1;
                 leaf(Node::Set(ByteSet::full()))
             }
-            b'[' => {
-                self.i += 1;
-                let set = self.bracket()?;
-                leaf(Node::Set(set))
-            }
-            b'\\' => {
-                let byte = self.escape();
-                leaf(Node::Set(ByteSet::single(byte)))
-            }
+            b'.' | b'[' | b'\\' => self.char_atom(c).map(Some),
+            _ if self.utf8 && c >= 0x80 => self.char_atom(c).map(Some),
             _ => {
                 self.i += 1;
                 leaf(Node::Set(ByteSet::single(c)))
+            }
+        }
+    }
+
+    /// The atoms that are a set of characters: `.` (UTF-8 mode), a bracket,
+    /// an escape or a multibyte character.  A separate function (never
+    /// inlined) so that `atom`, which recurses for groups, keeps a small
+    /// stack frame.
+    #[inline(never)]
+    fn char_atom(&mut self, c: u8) -> P<Tree> {
+        match c {
+            b'.' => {
+                self.i += 1;
+                // Any character, but no invalid byte.
+                Ok(self.char_set(vec![ESCAPED], true))
+            }
+            b'[' => {
+                self.i += 1;
+                self.bracket()
+            }
+            b'\\' => {
+                let c = self.escape();
+                Ok(self.char_set(vec![(c, c)], false))
+            }
+            _ => {
+                let (c, n) = charset::decode_at(self.s, self.i);
+                self.i += n;
+                Ok(self.char_set(vec![(c, c)], false))
             }
         }
     }
@@ -375,59 +620,113 @@ impl Parser<'_> {
         Ok(Some((lo, hi, k + 1)))
     }
 
-    /// A backslash escape at self.i; returns the byte and moves past it.
-    fn escape(&mut self) -> u8 {
+    /// A backslash escape at self.i; returns the character and moves past
+    /// it.  In UTF-8 mode a byte escape of 0x80 or more is an escaped
+    /// byte, unless it is a lead byte that the escapes after it complete
+    /// into a valid character (`\303\251` is `é`, as in gawk).
+    #[inline(never)]
+    fn escape(&mut self) -> u32 {
         let s = self.s;
-        let i = self.i;
-        let Some(&d) = s.get(i + 1) else {
+        let Some(&d) = s.get(self.i + 1) else {
             // A trailing backslash is a literal backslash.
             self.i += 1;
-            return b'\\';
+            return b'\\' as u32;
         };
-        let simple = match d {
-            b'n' => Some(b'\n'),
-            b't' => Some(b'\t'),
-            b'r' => Some(b'\r'),
-            b'f' => Some(0x0c),
-            b'v' => Some(0x0b),
-            b'a' => Some(0x07),
-            b'b' => Some(0x08),
-            _ => None,
-        };
-        if let Some(b) = simple {
-            self.i += 2;
-            return b;
+        if let Some((b, end)) = byte_escape(s, self.i) {
+            self.i = end;
+            if !self.utf8 || b < 0x80 {
+                return b as u32;
+            }
+            return self.utf8_sequence(b);
         }
-        if (b'0'..=b'7').contains(&d) {
-            // Up to three octal digits; the value wraps to a byte.
-            let mut j = i + 1;
-            let mut v: u32 = 0;
-            while j < s.len() && j < i + 4 && (b'0'..=b'7').contains(&s[j]) {
-                v = v * 8 + (s[j] - b'0') as u32;
-                j += 1;
-            }
-            self.i = j;
-            return (v & 0xff) as u8;
-        }
-        if d == b'x' {
-            let mut j = i + 2;
-            let mut v: u32 = 0;
-            while j < s.len() && j < i + 4 && s[j].is_ascii_hexdigit() {
-                v = v * 16 + (s[j] as char).to_digit(16).unwrap();
-                j += 1;
-            }
-            if j > i + 2 {
-                self.i = j;
-                return v as u8;
-            }
+        if self.utf8 && d >= 0x80 {
+            // `\é` is `é`.
+            let (c, n) = charset::decode_at(s, self.i + 1);
+            self.i += 1 + n;
+            return c;
         }
         self.i += 2;
-        d
+        match d {
+            b'n' => b'\n',
+            b't' => b'\t',
+            b'r' => b'\r',
+            b'f' => 0x0c,
+            b'v' => 0x0b,
+            b'a' => 0x07,
+            b'b' => 0x08,
+            _ => d,
+        }
+        .into()
     }
 
+    /// UTF-8 mode, after a byte escape for `lead` (0x80 or more): read
+    /// the escapes for its continuation bytes and return the character
+    /// they spell; if they do not spell one, the escaped byte `lead` alone
+    /// (and nothing more is read).
+    fn utf8_sequence(&mut self, lead: u8) -> u32 {
+        let lone = charset::ESCAPED_BASE + lead as u32;
+        if lead < 0xC0 {
+            return lone;
+        }
+        let need = if lead < 0xE0 {
+            1
+        } else if lead < 0xF0 {
+            2
+        } else {
+            3
+        };
+        let mut raw = vec![lead];
+        let mut j = self.i;
+        for _ in 0..need {
+            match byte_escape(self.s, j) {
+                Some((b, end)) if (0x80..=0xBF).contains(&b) => {
+                    raw.push(b);
+                    j = end;
+                }
+                _ => return lone,
+            }
+        }
+        if charset::char_len(&raw, 0) != raw.len() {
+            return lone; // e.g. an overlong form such as \300\200
+        }
+        self.i = j;
+        charset::decode_at(&raw, 0).0
+    }
+
+    /// The node for one character from the set `ranges` (or, `negated`,
+    /// from outside it).  C mode: a byte set.  UTF-8 mode: see
+    /// [`utf8_node`]; surrogates other than the escaped bytes are never
+    /// characters, and a negated set never matches an escaped byte.
+    #[inline(never)] // keep `atom`'s stack frame small: it recurses
+    fn char_set(&mut self, ranges: Vec<(u32, u32)>, negated: bool) -> Tree {
+        if !self.utf8 {
+            let mut set = byte_set(&ranges);
+            if negated {
+                set.negate();
+            }
+            return (Node::Set(set), 1);
+        }
+        let mut r = merge(ranges);
+        if negated {
+            r.push(ESCAPED);
+            r = complement(&merge(r));
+        }
+        r = subtract(&r, (0xD800, ESCAPED.0 - 1));
+        r = subtract(&r, (ESCAPED.1 + 1, 0xDFFF));
+        if r.iter().any(|&(lo, hi)| lo <= ESCAPED.1 && hi >= ESCAPED.0) {
+            self.raw = true;
+        }
+        if r.len() == 1 && r[0].1 < 0x80 {
+            return (Node::Set(byte_set(&r)), 1);
+        }
+        let node = utf8_node(&r);
+        let h = height(&node);
+        (node, h)
+    }
     /// A bracket expression; self.i is just after the `[`.
-    fn bracket(&mut self) -> P<ByteSet> {
-        let mut set = ByteSet::default();
+    #[inline(never)] // keep `atom`'s stack frame small: it recurses
+    fn bracket(&mut self) -> P<Tree> {
+        let mut set: Vec<(u32, u32)> = Vec::new();
         let negated = self.peek() == Some(b'^');
         if negated {
             self.i += 1;
@@ -444,10 +743,10 @@ impl Parser<'_> {
             first = false;
             let lo = match self.element()? {
                 Elem::Class(cs) => {
-                    set.union(&cs);
+                    set.extend(cs);
                     continue;
                 }
-                Elem::Byte(b) => b,
+                Elem::Char(b) => b,
             };
             // A range, unless the '-' is the last thing before ']'.
             if self.peek() == Some(b'-')
@@ -457,24 +756,28 @@ impl Parser<'_> {
                 self.i += 1;
                 let hi = match self.element()? {
                     Elem::Class(_) => return Err("character class as range end".into()),
-                    Elem::Byte(b) => b,
+                    Elem::Char(b) => b,
                 };
                 if hi < lo {
-                    return Err(format!(
-                        "invalid range {}-{}",
-                        String::from_utf8_lossy(&[lo]),
-                        String::from_utf8_lossy(&[hi])
-                    ));
+                    return Err(format!("invalid range {}-{}", self.show(lo), self.show(hi)));
                 }
-                set.insert_range(lo, hi);
+                set.push((lo, hi));
             } else {
-                set.insert(lo);
+                set.push((lo, lo));
             }
         }
-        if negated {
-            set.negate();
+        Ok(self.char_set(set, negated))
+    }
+
+    /// A character for an error message.
+    fn show(&self, c: u32) -> String {
+        let mut b = Vec::new();
+        if self.utf8 {
+            charset::encode(c, &mut b);
+        } else {
+            b.push(c as u8);
         }
-        Ok(set)
+        String::from_utf8_lossy(&b).into_owned()
     }
 
     /// One element inside brackets: a byte, an escape, `[:class:]`,
@@ -493,28 +796,79 @@ impl Parser<'_> {
             let name = &s[start..start + close];
             self.i = start + close + 2;
             if kind == b':' {
-                return class(name).map(Elem::Class).ok_or_else(|| {
+                let ranges = if self.utf8 {
+                    charset::class_ranges(name)
+                } else {
+                    class(name)
+                };
+                return ranges.map(|r| Elem::Class(r.to_vec())).ok_or_else(|| {
                     format!(
                         "unknown character class [:{}:]",
                         String::from_utf8_lossy(name)
                     )
                 });
             }
-            if name.len() != 1 {
+            // [.x.] (collating symbol) and [=x=] (equivalence class): one
+            // character, equivalent only to itself.
+            let one = if self.utf8 {
+                !name.is_empty() && charset::char_len(name, 0) == name.len()
+            } else {
+                name.len() == 1
+            };
+            if !one {
                 return Err(format!(
                     "invalid collating element [{k}{}{k}]",
                     String::from_utf8_lossy(name),
                     k = kind as char
                 ));
             }
-            return Ok(Elem::Byte(name[0]));
+            return Ok(Elem::Char(if self.utf8 {
+                charset::decode_at(name, 0).0
+            } else {
+                name[0] as u32
+            }));
         }
         if c == b'\\' {
-            return Ok(Elem::Byte(self.escape()));
+            return Ok(Elem::Char(self.escape()));
+        }
+        if self.utf8 && c >= 0x80 {
+            let (c, n) = charset::decode_at(s, self.i);
+            self.i += n;
+            return Ok(Elem::Char(c));
         }
         self.i += 1;
-        Ok(Elem::Byte(c))
+        Ok(Elem::Char(c as u32))
     }
+}
+
+/// `(value, end)` of an octal `\ddd` or hex `\xhh` escape at `i` (a
+/// backslash), else None.  Octal values wrap to a byte.
+fn byte_escape(s: &[u8], i: usize) -> Option<(u8, usize)> {
+    if s.get(i) != Some(&b'\\') {
+        return None;
+    }
+    let d = *s.get(i + 1)?;
+    if (b'0'..=b'7').contains(&d) {
+        let mut j = i + 1;
+        let mut v: u32 = 0;
+        while j < s.len() && j < i + 4 && (b'0'..=b'7').contains(&s[j]) {
+            v = v * 8 + (s[j] - b'0') as u32;
+            j += 1;
+        }
+        return Some(((v & 0xff) as u8, j));
+    }
+    if d == b'x' {
+        let mut j = i + 2;
+        let mut v: u32 = 0;
+        while j < s.len() && j < i + 4 && s[j].is_ascii_hexdigit() {
+            v = v * 16 + (s[j] as char).to_digit(16).unwrap();
+            j += 1;
+        }
+        if j > i + 2 {
+            return Some((v as u8, j));
+        }
+    }
+    None
 }
 
 /// A repeat count: leading zeros are ignored; above DUP_MAX is an error.
@@ -685,5 +1039,119 @@ mod tests {
         e("[a-[:digit:]]", "character class as range end");
         e("[[.ab.]]", "invalid collating element [.ab.]");
         e("[[:alpha]", "unterminated [:");
+    }
+
+    fn u(s: &[u8]) -> Parsed {
+        parse_mode(s, true).unwrap()
+    }
+    fn u_err(s: &str) -> String {
+        parse_mode(s.as_bytes(), true).err().unwrap().to_string()
+    }
+
+    /// Does `seq` (byte ranges) match exactly the bytes `b`?
+    fn seq_matches(seq: &[(u8, u8)], b: &[u8]) -> bool {
+        seq.len() == b.len() && seq.iter().zip(b).all(|(&(lo, hi), &x)| lo <= x && x <= hi)
+    }
+
+    #[test]
+    fn utf8_sequences_cover_exactly_the_range() {
+        for (lo, hi) in [
+            (0x80, 0x10FFFF),
+            (0xE9, 0xE9),
+            (0x7FF, 0x800),
+            (0xD7FF, 0xE000),
+            (0x123, 0x4567),
+            (0xFFFE, 0x10001),
+            (0x10000, 0x10FFFF),
+        ] {
+            let mut seqs = Vec::new();
+            utf8_sequences(lo, hi, &mut seqs);
+            let step = if hi - lo > 5000 { 97 } else { 1 };
+            let probes =
+                (0x80..=0x10FFFFu32)
+                    .step_by(step)
+                    .chain([lo, hi, lo.saturating_sub(1), hi + 1]);
+            for c in probes {
+                let mut b = Vec::new();
+                charset::utf8_bytes(c, &mut b);
+                let n = seqs.iter().filter(|s| seq_matches(s, &b)).count();
+                let want = (lo <= c && c <= hi) as usize;
+                assert_eq!(n, want, "U+{c:X} in {lo:X}-{hi:X}");
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_mode_reads_characters() {
+        // A multibyte character is its bytes, spliced into the literal.
+        assert_eq!(u("aé".as_bytes()).node, lit("aé"));
+        // A repeat applies to the whole character.
+        assert_eq!(u("é+".as_bytes()).node, rep(lit("é"), 1, None));
+        // Escapes that spell a character join into it (gawk).
+        assert_eq!(u(br"\303\251").node, lit("é"));
+        assert_eq!(u(br"\xc3\xa9").node, lit("é"));
+        // `\é` is `é`.
+        assert_eq!(u("\\é".as_bytes()).node, lit("é"));
+        // [=x=] and [.x.] hold one character.
+        assert_eq!(u("[[=é=]]".as_bytes()).node, lit("é"));
+        assert_eq!(u("[[.é.]]".as_bytes()).node, lit("é"));
+        assert_eq!(
+            u_err("[[=ab=]]"),
+            "bad regular expression /[[=ab=]]/: invalid collating element [=ab=]"
+        );
+        // Ranges and their errors are by character.
+        assert_eq!(
+            u_err("[é-a]"),
+            "bad regular expression /[é-a]/: invalid range é-a"
+        );
+        assert_eq!(
+            u("[à-é]".as_bytes()).node,
+            Node::Cat(vec![set_of(&[0xC3]), Node::Set(byte_set(&[(0xA0, 0xA9)]))])
+        );
+        // An ASCII-only set stays one byte set (the C-mode fast path).
+        assert_eq!(u(b"[a-c]").node, p("[a-c]"));
+    }
+
+    #[test]
+    fn utf8_mode_invalid_bytes() {
+        // An invalid byte, or a lone high escape, is the escaped byte: it
+        // makes the pattern raw (see `regex/mod.rs`).
+        for raw in [
+            &br"\xe9"[..],
+            br"\351",
+            br"\303",
+            br"\303x",
+            br"\300\200",
+            br"[\200-\377]",
+            b"\xe9",
+        ] {
+            let parsed = u(raw);
+            assert!(parsed.raw, "{}", String::from_utf8_lossy(raw));
+        }
+        let raw = u(br"\xe9");
+        assert_eq!(
+            raw.node,
+            Node::Cat(vec![set_of(&[0xED]), set_of(&[0xB3]), set_of(&[0xA9])])
+        );
+        // `.`, `[^a]`, classes and characters never match one.
+        for src in ["a.b", "[^a]", "[[:alpha:]]", "é", "[^[:space:]]+"] {
+            assert!(!u(src.as_bytes()).raw, "{src}");
+        }
+    }
+
+    #[test]
+    fn utf8_sets_stay_small() {
+        // The trie keeps even the biggest classes near a thousand states.
+        for (src, max) in [
+            (".", 40),
+            ("[^a]", 40),
+            ("[[:alpha:]]", 1500),
+            ("[[:punct:]]", 1200),
+            ("[[:upper:]]", 400),
+            ("[[:space:]]", 30),
+        ] {
+            let n = crate::regex::nfa::size(&u(src.as_bytes()).node);
+            assert!(n <= max, "{src}: {n}");
+        }
     }
 }

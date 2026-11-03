@@ -172,10 +172,32 @@ pub fn is_boundary(s: &[u8], i: usize) -> bool {
     j == i
 }
 
+/// `i`, or if `i` is inside a multibyte character, the end of that
+/// character.  Only the three bytes before `i` are looked at: a lead byte
+/// is never inside another character, so a valid sequence that starts
+/// there and reaches past `i` settles it.
+pub fn round_up(s: &[u8], i: usize) -> usize {
+    if i >= s.len() || !(0x80..0xC0).contains(&s[i]) {
+        return i;
+    }
+    for back in 1..=3.min(i) {
+        let j = i - back;
+        if s[j] >= 0xC0 {
+            let n = char_len(s, j);
+            return if n > back { j + n } else { i };
+        }
+    }
+    i
+}
+
 /// One past the character starting at `i` (`i < s.len()`), in either mode.
 #[inline]
 pub fn next(s: &[u8], i: usize, utf8: bool) -> usize {
-    if utf8 { i + char_len(s, i) } else { i + 1 }
+    if utf8 && i < s.len() {
+        i + char_len(s, i)
+    } else {
+        i + 1
+    }
 }
 
 /// The code-point ranges of a POSIX class in UTF-8 mode.
@@ -296,6 +318,17 @@ mod tests {
             ("LC_CTYPE", "POSIX"),
             ("LANG", "C.UTF-8")
         ])));
+    }
+
+    #[test]
+    fn round_up_finds_the_next_character() {
+        let s = "aé€".as_bytes(); // a C3 A9 E2 82 AC
+        let got: Vec<usize> = (0..=s.len()).map(|i| round_up(s, i)).collect();
+        assert_eq!(got, [0, 1, 3, 3, 6, 6, 6]);
+        // Invalid bytes are characters of their own.
+        let s = b"\xc3x\xa9\xe2\x82";
+        let got: Vec<usize> = (0..=s.len()).map(|i| round_up(s, i)).collect();
+        assert_eq!(got, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

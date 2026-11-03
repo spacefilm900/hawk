@@ -547,10 +547,16 @@ utf8/case_mapping
 utf8/comparison
 utf8/concat_bytes
 utf8/default_fs
+utf8/field_separators
+utf8/invalid_bytes
 utf8/invalid_bytes_substr
 utf8/length_substr_index
 utf8/match_rstart
 utf8/output_bytes
 utf8/printf_width
 utf8/record_separator
+utf8/regex_brackets
+utf8/regex_classes
+utf8/regex_dot
+utf8/regex_escapes
 utf8/split_chars

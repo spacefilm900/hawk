@@ -17,9 +17,9 @@ mawk works on bytes.
 
 Each pattern counts as one case.  The exit status is 1 when
 
-* any line of a *gated* table disagrees (HARD_GATES: the C table is a hard
-  gate since the v1.1 work started, the UTF-8 table becomes one once
-  hawk's UTF-8 mode is in), or
+* any line of a *gated* table disagrees (HARD_GATES: the C table has been
+  a hard gate since the v1.1 work started, the UTF-8 table since hawk's
+  UTF-8 mode, stage 4), or
 * a pattern listed in tests/corpus/REGEX_PASSING fails (a regression).
 """
 
@@ -41,7 +41,7 @@ import corpus  # noqa: E402
 RECORD = corpus.CORPUS / "regex_differential.json"
 RECORD_UTF8 = corpus.CORPUS / "regex_differential_utf8.json"
 # Which tables must agree on every line ("c" and/or "utf8").
-HARD_GATES = {"c"}
+HARD_GATES = {"c", "utf8"}
 PASSING = corpus.CORPUS / "REGEX_PASSING"
 ERROR = "ERROR"
 

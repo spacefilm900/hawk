@@ -1,4 +1,5 @@
-//! hawk's own regular-expression engine (POSIX EREs, bytes, C locale).
+//! hawk's own regular-expression engine (POSIX EREs, over bytes in the C
+//! locale and over characters in UTF-8 mode).
 //!
 //! The pipeline is the classic one, as in pyawk's `regex.py`:
 //!
@@ -22,6 +23,16 @@
 //!    first mark at or after `pos` is the leftmost start.
 //! 3. From the start, the anchored DFA finds the longest match.
 //!
+//! UTF-8 mode changes only the parser (see `parse.rs`): each set of
+//! characters becomes an alternation of UTF-8 byte sequences, so the
+//! automata still read bytes, and a match of a valid sequence always
+//! starts and ends on character boundaries (a valid sequence never starts
+//! with a continuation byte).  Invalid bytes need one more step: a *raw*
+//! pattern (one that can match an invalid byte) is run on a copy of the
+//! text in which each invalid byte b is written as the three-byte form of
+//! U+DC00+b, and the positions are mapped back ([`Transcoded`]).  Text
+//! that is valid UTF-8, the usual case, is used as it is.
+//!
 //! The DFAs live in `RefCell`s: they grow while matching, but a `Regex` is
 //! shared through `&Regex` / `Rc<Regex>`.  `RefCell` moves Rust's "one
 //! writer at a time" check from compile time to run time.
@@ -36,7 +47,7 @@ use crate::error::Error;
 use dfa::{ACCEPT, ACCEPT_END, DEAD, Dfa};
 pub use nfa::NFA_LIMIT;
 pub use parse::DUP_MAX;
-use parse::{Node, parse};
+use parse::{Node, parse_mode};
 
 pub struct Regex {
     /// Anchored forward DFA: the longest match from a given start.
@@ -52,12 +63,23 @@ pub struct Regex {
     literal: Option<Vec<u8>>,
     /// Number of NFA states (for the interpreter's cache limit).
     size: u64,
+    /// Compiled in UTF-8 mode (callers step by characters).
+    utf8: bool,
+    /// UTF-8 mode: can match an invalid byte (see [`Transcoded`]).
+    raw: bool,
 }
 
 impl Regex {
-    /// Compile an ERE.  Errors read `bad regular expression /src/: why`.
+    /// Compile an ERE for the C locale.  Errors read `bad regular
+    /// expression /src/: why`.
     pub fn new(src: &[u8]) -> Result<Regex, Error> {
-        let tree = parse(src)?;
+        Regex::with_mode(src, false)
+    }
+
+    /// Compile an ERE, over characters if `utf8`.
+    pub fn with_mode(src: &[u8], utf8: bool) -> Result<Regex, Error> {
+        let parsed = parse_mode(src, utf8)?;
+        let tree = parsed.node;
         let size = nfa::size(&tree);
         if size > NFA_LIMIT {
             return Err(Error::Runtime(format!(
@@ -76,7 +98,23 @@ impl Regex {
             first,
             literal,
             size,
+            utf8,
+            raw: parsed.raw,
         })
+    }
+
+    /// Was this regex compiled in UTF-8 mode?
+    pub fn utf8(&self) -> bool {
+        self.utf8
+    }
+
+    /// The text a raw regex must run on instead of `text`, if any.
+    fn transcode(&self, text: &[u8]) -> Option<Transcoded> {
+        if self.raw {
+            Transcoded::new(text)
+        } else {
+            None
+        }
     }
 
     /// How many NFA states this regex uses.
@@ -86,6 +124,13 @@ impl Regex {
 
     /// Does the regex match anywhere in `text`?
     pub fn is_match(&self, text: &[u8]) -> bool {
+        match self.transcode(text) {
+            Some(t) => self.scan_for_match(&t.text),
+            None => self.scan_for_match(text),
+        }
+    }
+
+    fn scan_for_match(&self, text: &[u8]) -> bool {
         if let Some(lit) = &self.literal {
             return find_bytes(text, lit, 0).is_some();
         }
@@ -134,8 +179,9 @@ impl Regex {
         Finder::new(self, text).find(pos)
     }
 
-    /// End of the longest match starting exactly at `start`, if any.
-    pub fn longest(&self, text: &[u8], start: usize) -> Option<usize> {
+    /// End of the longest match starting exactly at `start`, if any
+    /// (`text` is already transcoded if need be).
+    fn longest(&self, text: &[u8], start: usize) -> Option<usize> {
         let mut dfa = self.fwd.borrow_mut();
         let n = text.len();
         let mut d = dfa.initial(start == 0);
@@ -163,6 +209,8 @@ impl Regex {
 pub struct Finder<'r, 't> {
     re: &'r Regex,
     text: &'t [u8],
+    /// The text to search instead, for a raw regex on invalid UTF-8.
+    trans: Option<Transcoded>,
     budget: usize,
     /// `marks[p]`: a match starts at p (computed when the budget runs out).
     marks: Option<Vec<bool>>,
@@ -170,24 +218,42 @@ pub struct Finder<'r, 't> {
 
 impl<'r, 't> Finder<'r, 't> {
     pub fn new(re: &'r Regex, text: &'t [u8]) -> Finder<'r, 't> {
+        let trans = re.transcode(text);
+        let n = trans.as_ref().map_or(text.len(), |t| t.text.len());
         Finder {
             re,
             text,
-            budget: 2 * text.len() + 64,
+            trans,
+            budget: 2 * n + 64,
             marks: None,
         }
     }
 
     /// The leftmost-longest match at or after `pos` (`pos <= len`).
-    pub fn find(&mut self, pos: usize) -> Option<(usize, usize)> {
-        let text = self.text;
+    pub fn find(&mut self, mut pos: usize) -> Option<(usize, usize)> {
+        if self.re.utf8 {
+            // Matches start on characters (see the top of this file).
+            pos = crate::charset::round_up(self.text, pos);
+        }
+        // `take` moves the transcoded text out for the call (so `self` can
+        // be borrowed mutably meanwhile) and it is put back after.
+        let Some(t) = self.trans.take() else {
+            return self.find_in(self.text, pos);
+        };
+        let span = self.find_in(&t.text, t.to_new[pos]);
+        let span = span.map(|(a, b)| (t.to_old[a], t.to_old[b]));
+        self.trans = Some(t);
+        span
+    }
+
+    fn find_in(&mut self, text: &[u8], pos: usize) -> Option<(usize, usize)> {
         if let Some(lit) = &self.re.literal {
             return find_bytes(text, lit, pos).map(|s| (s, s + lit.len()));
         }
         if self.marks.is_none() {
-            match self.probe(pos) {
+            match self.probe(text, pos) {
                 Probe::Found(span) => return span,
-                Probe::OutOfBudget => self.mark_starts(),
+                Probe::OutOfBudget => self.mark_starts(text),
             }
         }
         let marks = self.marks.as_ref().unwrap();
@@ -197,8 +263,7 @@ impl<'r, 't> Finder<'r, 't> {
     }
 
     /// Try candidate starts left to right with the anchored DFA.
-    fn probe(&mut self, pos: usize) -> Probe {
-        let text = self.text;
+    fn probe(&mut self, text: &[u8], pos: usize) -> Probe {
         let n = text.len();
         if self.budget == 0 {
             return Probe::OutOfBudget;
@@ -257,8 +322,7 @@ impl<'r, 't> Finder<'r, 't> {
     }
 
     /// One backwards pass with the reversed pattern marks every match start.
-    fn mark_starts(&mut self) {
-        let text = self.text;
+    fn mark_starts(&mut self, text: &[u8]) {
         let n = text.len();
         let mut marks = vec![false; n + 1];
         let mut dfa = self.re.rev.borrow_mut();
@@ -275,6 +339,58 @@ impl<'r, 't> Finder<'r, 't> {
             marks[0] = true;
         }
         self.marks = Some(marks);
+    }
+}
+
+/// UTF-8 mode: a text that is not valid UTF-8, rewritten for a raw regex
+/// with each invalid byte b as the three bytes that encode U+DC00+b
+/// (`ED B2 80`..`ED B3 BF`), which is what the pattern's escaped bytes
+/// compile to.  Valid characters are copied as they are.
+struct Transcoded {
+    text: Vec<u8>,
+    /// `to_new[i]`: where offset i of the original text is in `text` (an
+    /// offset inside a character maps to the end of that character).
+    to_new: Vec<usize>,
+    /// `to_old[j]`: the original offset of the character at offset j of
+    /// `text` (matches only start and end on characters).
+    to_old: Vec<usize>,
+}
+
+impl Transcoded {
+    /// None if `text` is valid UTF-8 (nothing to rewrite).
+    fn new(text: &[u8]) -> Option<Transcoded> {
+        if std::str::from_utf8(text).is_ok() {
+            return None;
+        }
+        let mut t = Transcoded {
+            text: Vec::with_capacity(text.len() + 16),
+            to_new: vec![0; text.len() + 1],
+            to_old: Vec::with_capacity(text.len() + 17),
+        };
+        let mut i = 0;
+        while i < text.len() {
+            let len = crate::charset::char_len(text, i);
+            let at = t.text.len();
+            if len == 1 && text[i] >= 0x80 {
+                crate::charset::utf8_bytes(
+                    crate::charset::ESCAPED_BASE + text[i] as u32,
+                    &mut t.text,
+                );
+            } else {
+                t.text.extend_from_slice(&text[i..i + len]);
+            }
+            // Offsets inside a character map to the next one (a search
+            // from there must not find a match at the character's start).
+            t.to_new[i] = at;
+            for k in 1..len {
+                t.to_new[i + k] = t.text.len();
+            }
+            t.to_old.resize(t.text.len(), i);
+            i += len;
+        }
+        t.to_new[text.len()] = t.text.len();
+        t.to_old.push(text.len());
+        Some(t)
     }
 }
 
@@ -461,5 +577,49 @@ mod tests {
         assert!(!r.is_match(&text));
         assert!(r.scan.borrow().stored() <= dfa::KERNEL_LIMIT);
         assert!(r.scan.borrow().flushes > 0);
+    }
+
+    fn ure(s: &[u8]) -> Regex {
+        Regex::with_mode(s, true).unwrap()
+    }
+
+    #[test]
+    fn utf8_matches_whole_characters() {
+        let t = "xéy".as_bytes();
+        assert_eq!(ure(b"x.y").find_at(t, 0), Some((0, 4)));
+        assert_eq!(re("x.y").find_at(t, 0), None); // C mode: é is 2 bytes
+        assert_eq!(
+            ure("é+".as_bytes()).find_at("aééb".as_bytes(), 0),
+            Some((1, 5))
+        );
+        assert_eq!(ure(b"[^x]").find_at(t, 0), Some((1, 3)));
+        // A search from inside a character finds the next one.
+        assert_eq!(ure(b"[^x]").find_at(t, 2), Some((3, 4)));
+        assert!(ure(b"^.{3}$").is_match(t));
+    }
+
+    #[test]
+    fn utf8_invalid_bytes_match_only_their_escape() {
+        let t = b"a\xe9b\xc3\xa9";
+        // `.` and `[^a]` skip the invalid byte; the escape finds it.
+        assert_eq!(ure(b"[^a]").find_at(t, 0), Some((2, 3)));
+        assert_eq!(ure(b".b").find_at(t, 0), None);
+        assert_eq!(ure(br"\351").find_at(t, 0), Some((1, 2)));
+        assert_eq!(ure(br"\351b\303\251").find_at(t, 0), Some((1, 5)));
+        assert!(ure(br"a\351").is_match(t));
+        assert!(!ure(br"a\351").is_match(b"a\xc3\xa9"));
+        // A raw byte in the pattern is the same as its escape.
+        assert_eq!(ure(b"\xe9").find_at(t, 0), Some((1, 2)));
+        // Positions map back across the rewritten text.
+        let r = ure(br"[\200-\377]");
+        let mut f = Finder::new(&r, b"\xff\xc3\xa9\xfe");
+        assert_eq!(f.find(0), Some((0, 1)));
+        assert_eq!(f.find(1), Some((3, 4)));
+        assert_eq!(f.find(2), Some((3, 4)));
+        assert_eq!(f.find(4), None);
+        // An empty match inside a character is never reported.
+        let r = ure(br"\351*");
+        let mut f = Finder::new(&r, "é".as_bytes());
+        assert_eq!(f.find(1), Some((2, 2)));
     }
 }
