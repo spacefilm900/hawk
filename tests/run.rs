@@ -375,3 +375,40 @@ fn nextfile_skips_the_rest_of_the_file() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// ENVIRON values are strnums: ` 42 ` and `1e2` compare as numbers, but
+/// hex (`0x1A`) is not a number, so it compares as a string (onetrue and
+/// mawk; gawk --posix reads hex). Values are not escape-processed, and a
+/// child process sees the original environment even after ENVIRON changes.
+#[test]
+fn environ_values_are_strnums_but_hex_is_a_string() {
+    let prog = r#"BEGIN {
+        print (ENVIRON["SP"] == 42), (ENVIRON["EX"] == 100), (ENVIRON["HX"] == 26), (ENVIRON["HX"] < 5)
+        print ENVIRON["ESC"]
+        ENVIRON["SP"] = "changed"; system("echo \"[$SP]\"")
+    }"#;
+    let out = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .arg(prog)
+        .env("SP", " 42 ")
+        .env("EX", "1e2")
+        .env("HX", "0x1A")
+        .env("ESC", r"a\tb")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1 1 0 1\na\\tb\n[ 42 ]\n"
+    );
+    assert!(out.status.success());
+}
+
+/// A directory operand cannot be opened: the same message as a missing
+/// file, exit 2 (pyawk, mawk, gawk; onetrue skips it).
+#[test]
+fn a_directory_operand_is_an_error() {
+    let (o, e, rc) = hawk(&["{ print }", "/"], "");
+    assert_eq!(
+        (o.as_str(), e.as_str(), rc),
+        ("", "hawk: cannot open / (Is a directory)\n", 2)
+    );
+}

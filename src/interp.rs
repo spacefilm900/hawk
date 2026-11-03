@@ -515,7 +515,13 @@ impl<'p> Interp<'p> {
             } else {
                 use std::os::unix::ffi::OsStrExt;
                 let path = std::ffi::OsStr::from_bytes(&arg);
-                match std::fs::File::open(path) {
+                // A directory opens fine on Unix but cannot be read, so
+                // it is reported here as "cannot open" (EISDIR = 21).
+                let opened = std::fs::File::open(path).and_then(|f| match f.metadata() {
+                    Ok(m) if m.is_dir() => Err(std::io::Error::from_raw_os_error(21)),
+                    _ => Ok(f),
+                });
+                match opened {
                     Ok(f) => self.main = Main::File(RecordReader::new(Box::new(f))),
                     Err(e) => {
                         return rt(format!(
