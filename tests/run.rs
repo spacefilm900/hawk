@@ -290,3 +290,23 @@ fn version_is_1_0() {
     // `--version` prints the version from Cargo.toml; v1.0 is the first release.
     assert_eq!(out(&["--version"], ""), "hawk 1.0.0\n");
 }
+
+#[test]
+fn next_inside_a_function() {
+    // The call may sit inside an expression or a pattern; `next` still
+    // abandons the rest of the rules for this record.
+    let prog = "function f() { next } $1 == \"b\" { x = 1 + f() } { print } END { print \"end\" }";
+    assert_eq!(out(&[prog], "a\nb\nc\n"), "a\nc\nend\n");
+    let prog = "function skip() { if ($1 == \"b\") next; return 1 } skip() { print }";
+    assert_eq!(out(&[prog], "a\nb\nc\n"), "a\nc\n");
+    // Called from BEGIN or END there is no record to skip: a fatal error.
+    let (o, e, code) = hawk(
+        &["function f() { next } BEGIN { print 1; f(); print 2 }"],
+        "",
+    );
+    assert_eq!((o.as_str(), code), ("1\n", 2));
+    assert!(e.contains("next called from a function in BEGIN"), "{e}");
+    let (_, e, code) = hawk(&["function f() { next } END { f() }"], "x\n");
+    assert_eq!(code, 2);
+    assert!(e.contains("next called from a function in END"), "{e}");
+}

@@ -182,6 +182,10 @@ struct Parser {
     in_function: Option<String>,
     /// How many loops enclose us (`break`/`continue` need one).
     loop_depth: u32,
+    /// "BEGIN" or "END" while parsing that action (`next` and `nextfile`
+    /// are syntax errors there).  `&'static str` is a string constant
+    /// built into the program, so storing one costs nothing.
+    in_special: Option<&'static str>,
     /// Every name used as a variable or array, with its line.
     var_uses: Vec<(String, u32)>,
     /// Every user function call: name, number of arguments, line.
@@ -225,6 +229,7 @@ impl Parser {
             no_gt: false,
             in_function: None,
             loop_depth: 0,
+            in_special: None,
             var_uses: Vec::new(),
             calls: Vec::new(),
             depth: 0,
@@ -508,17 +513,20 @@ impl Parser {
     /// `pattern`, `pattern {...}`, `start, end [{...}]`, `{...}`.
     fn parse_item(&mut self, prog: &mut Program) -> Result<(), Error> {
         match self.tok() {
-            Tok::Begin => {
+            Tok::Begin | Tok::End => {
+                let is_begin = self.at(&Tok::Begin);
                 self.advance();
                 self.skip_newlines();
-                let block = self.parse_block()?;
-                prog.begin.push(block);
-            }
-            Tok::End => {
-                self.advance();
-                self.skip_newlines();
-                let block = self.parse_block()?;
-                prog.end.push(block);
+                self.in_special = Some(if is_begin { "BEGIN" } else { "END" });
+                // Reset the flag before `?` can return an error early.
+                let block = self.parse_block();
+                self.in_special = None;
+                let block = block?;
+                if is_begin {
+                    prog.begin.push(block);
+                } else {
+                    prog.end.push(block);
+                }
             }
             Tok::Function => self.parse_function(prog)?,
             Tok::Name(n) if n == "func" && matches!(self.peek(1), Tok::FuncName(_)) => {
@@ -861,14 +869,16 @@ impl Parser {
                 })
             }
             Tok::Next => {
-                // onetrue-awk and mawk reject `next` in a function (gawk
-                // allows it); we follow the majority.
-                if let Some(f) = &self.in_function {
-                    return Err(Error::syntax(
-                        format!("next is not allowed inside a function ({f})"),
-                        line,
-                    ));
+                // There is no current record in BEGIN or END.  POSIX leaves
+                // `next` there undefined; mawk and gawk reject it while
+                // parsing (onetrue-awk only when it runs), and so do we.
+                if let Some(which) = self.in_special {
+                    return Err(Error::syntax(format!("next used in {which} action"), line));
                 }
+                // In a function body it is allowed: POSIX restricts `next`
+                // only when "invoked in a BEGIN or END action" (gawk agrees;
+                // mawk and onetrue-awk reject it).  A call from BEGIN or END
+                // is caught when it happens (see `Interp::run_special`).
                 self.advance();
                 Ok(Stmt::Next)
             }
@@ -1832,6 +1842,33 @@ mod tests {
     }
 
     #[test]
+    fn next_in_begin_or_end_is_a_syntax_error() {
+        // POSIX leaves `next` in BEGIN/END undefined; mawk and gawk reject
+        // it while parsing (onetrue-awk only when it runs), so the program
+        // never starts, even where the `next` could never run.
+        for (src, which) in [
+            ("BEGIN { next }", "BEGIN"),
+            ("END { next }", "END"),
+            ("BEGIN { if (0) next }", "BEGIN"),
+            ("END { while (1) { next } }", "END"),
+        ] {
+            let msg = err(src);
+            assert!(
+                msg.contains(&format!("next used in {which} action")),
+                "{src}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_in_a_function_is_allowed() {
+        // POSIX only restricts `next` "invoked in a BEGIN or END action";
+        // gawk agrees (a call from BEGIN/END is a run-time error).
+        let prog = p("function f() { next } { f() }");
+        assert_eq!(prog.functions[0].body, vec![Stmt::Next]);
+    }
+
+    #[test]
     fn deferred_features_error_clearly() {
         assert!(err("{ nextfile }").contains("nextfile is not supported yet"));
     }
@@ -1982,7 +2019,6 @@ mod tests {
             "BEGIN { for (k in f) ; } function f() { }",
             "BEGIN { return 1 }", // return outside a function
             "{ return }",
-            "function f() { next }",  // next inside a function
             "function f() { break }", // break outside a loop
             "BEGIN { continue }",
             "function f(a { }",

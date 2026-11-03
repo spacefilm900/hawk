@@ -211,6 +211,7 @@ fn run(parsed: Parsed) -> i32 {
         let mut interp = Interp::new(&program, &parsed.config).map_err(|u| match u {
             crate::interp::Unwind::Err(e) => e,
             crate::interp::Unwind::Exit => Error::Runtime("exit".into()),
+            crate::interp::Unwind::Next => Error::Runtime("next".into()),
         })?;
         interp.run()
     });

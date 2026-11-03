@@ -89,7 +89,11 @@ from an expression may `exit`), so it travels on the error side of
 `Result`, together with runtime errors, as `Unwind::Exit` /
 `Unwind::Err(e)`. `?` carries it up to `Interp::run`, which runs the END
 actions after an `exit` in BEGIN or a rule and stops at once for an `exit`
-in END.
+in END. A `next` executed inside a function body has the same problem
+(the call may be in the middle of an expression), so the call turns its
+`Flow::Next` into `Unwind::Next`, which the record loop catches; from
+BEGIN or END it becomes the run-time error "next called from a function
+in BEGIN" (pyawk v1.1 and gawk).
 
 ## Values (phase 3)
 

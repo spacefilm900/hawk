@@ -95,10 +95,16 @@ enum Flow {
 }
 
 /// Why evaluation stopped early: an `exit` statement (the status is in
-/// `Interp::exit_code`) or an error.
+/// `Interp::exit_code`), a `next` executed inside a function, or an error.
+///
+/// `next` in a rule's own action is an ordinary `Flow::Next`, but inside a
+/// function the call may sit in the middle of an expression (`x = 1 + f()`),
+/// so it has to unwind through `eval` like `exit` does; the record loop
+/// catches it.
 #[derive(Debug)]
 pub enum Unwind {
     Exit,
+    Next,
     Err(Error),
 }
 
@@ -339,6 +345,8 @@ impl<'p> Interp<'p> {
                 Ok(self.exit_code)
             }
             Err(Unwind::Err(e)) => Err(e),
+            // run_special and main_loop catch every `next`.
+            Err(Unwind::Next) => Err(Error::Runtime("next outside a rule".into())),
         }
     }
 
@@ -346,7 +354,7 @@ impl<'p> Interp<'p> {
         let prog = self.prog;
         let body = (|| -> R<()> {
             for block in &prog.begin {
-                self.run_special(block)?;
+                self.run_special(block, "BEGIN")?;
             }
             if !prog.rules.is_empty() || !prog.end.is_empty() {
                 self.main_loop()?;
@@ -358,43 +366,59 @@ impl<'p> Interp<'p> {
             Err(e) => return Err(e),
         }
         for block in &prog.end {
-            self.run_special(block)?;
+            self.run_special(block, "END")?;
         }
         Ok(())
     }
 
-    fn run_special(&mut self, block: &'p [Stmt]) -> R<()> {
-        if self.exec_block(block)? == Flow::Next {
-            return rt("next used in BEGIN or END action");
+    /// Run one BEGIN (`which` is "BEGIN") or END block.  The parser rejects
+    /// `next` written directly in it, but a function called from it may
+    /// still execute one; with no record to skip, that is a fatal error
+    /// (as in gawk).
+    fn run_special(&mut self, block: &'p [Stmt], which: &str) -> R<()> {
+        match self.exec_block(block) {
+            Err(Unwind::Next) => rt(format!("next called from a function in {which}")),
+            Err(e) => Err(e),
+            Ok(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn main_loop(&mut self) -> R<()> {
-        let prog = self.prog;
         while let Some(rec) = self.next_main_record()? {
             self.bump("NR");
             self.bump("FNR");
             self.set_record(Rc::from(rec));
-            for (i, rule) in prog.rules.iter().enumerate() {
-                let selected = match (&rule.pattern, &rule.end) {
-                    (Some(start), Some(end)) => self.in_range(i, start, end)?,
-                    (Some(p), None) => self.cond(p)?,
-                    (None, _) => true,
-                };
-                if !selected {
-                    continue;
+            match self.run_rules() {
+                // `next` inside a function called from a pattern or an
+                // action: abandon this record's rules just the same.
+                Ok(()) | Err(Unwind::Next) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Run every main rule on the current record, stopping at `next`.
+    fn run_rules(&mut self) -> R<()> {
+        let prog = self.prog;
+        for (i, rule) in prog.rules.iter().enumerate() {
+            let selected = match (&rule.pattern, &rule.end) {
+                (Some(start), Some(end)) => self.in_range(i, start, end)?,
+                (Some(p), None) => self.cond(p)?,
+                (None, _) => true,
+            };
+            if !selected {
+                continue;
+            }
+            match &rule.action {
+                None => {
+                    let mut line = self.record.to_vec();
+                    line.extend_from_slice(&self.var_str("ORS"));
+                    self.io.write_stdout(&line)?;
                 }
-                match &rule.action {
-                    None => {
-                        let mut line = self.record.to_vec();
-                        line.extend_from_slice(&self.var_str("ORS"));
-                        self.io.write_stdout(&line)?;
-                    }
-                    Some(body) => {
-                        if self.exec_block(body)? == Flow::Next {
-                            break;
-                        }
+                Some(body) => {
+                    if self.exec_block(body)? == Flow::Next {
+                        break;
                     }
                 }
             }
@@ -1280,6 +1304,8 @@ impl<'p> Interp<'p> {
         self.frames.pop();
         Ok(match flow? {
             Flow::Return => std::mem::replace(&mut self.ret, Value::Uninit),
+            // `next` in a function body: unwind to the record loop.
+            Flow::Next => return Err(Unwind::Next),
             _ => Value::Uninit,
         })
     }
