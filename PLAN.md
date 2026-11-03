@@ -108,4 +108,11 @@ pyawk v1.1's extras, in four stages; `main` stays at v1.0.
   Corpus 535/26/121 (the failures are stages 2-4), AST 7 pending.
 * Stage 2, `nextfile`: corpus 542/19/121 (golden `nextfile` 7/7), AST
   0 pending. Left: 6 `io` cases (stage 3), 13 `utf8` cases (stage 4).
+* Stage 3, I/O audit and ENVIRON: `cmd | getline` leaves NR alone,
+  `getline < dir` is -1 and a directory operand an error; null names are
+  fatal; `-` is a file for output; special names, `close()` and `fflush()`
+  as in pyawk v1.1's decision table; write errors ("write error on NAME",
+  exit 2); SIGPIPE death; deep nesting uses pyawk's message. Corpus
+  548/13/121 (golden `io` 18/18, `environ` 5/5); the 13 failures are all
+  `utf8` (stage 4). `tests/io.rs` has 19 end-to-end I/O tests.
 

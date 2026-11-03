@@ -13,8 +13,8 @@ came first, and it uses the same test corpus and the same semantic decisions.
   can be added on top later, as pyawk v1.1 did.
 * **Scope.** The first target is pyawk v1.0's feature set (tag `v1.0` of
   pyawk). The v1.1 extras are being ported on the `enhancements` branch:
-  the POSIX parse-time errors and `nextfile` are done; `ENVIRON` and the
-  full I/O audit, then UTF-8 locales, come next. See [PLAN.md](PLAN.md).
+  the POSIX parse-time errors, `nextfile`, `ENVIRON` and the full I/O
+  audit are done; UTF-8 locales come next. See [PLAN.md](PLAN.md).
 
 **Status:** the lexer, parser, interpreter and the POSIX regex engine are
 done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570

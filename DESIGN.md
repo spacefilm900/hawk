@@ -148,12 +148,8 @@ resolved to slots or cached at load time without changing the interface.
   the FS that was current when the record was read.
 * **Output** to stdout goes through a 64 KiB buffer, flushed before running
   a command, at exit, and after every write when stdout is a terminal.
-  Output files are buffered too; if writing out the rest of a file's
-  buffer fails when it is closed (by `close()` or at exit), that is a
-  fatal "write error on NAME (reason)", exit status 2, since the data is
-  lost. For an output pipe, a command that stopped reading is not an error:
-  `close()` returns the command's exit status, as in pyawk, gawk and
-  onetrue-awk (mawk dies of SIGPIPE).
+  Output files are buffered too. When a flush fails, see "I/O (stage 3)"
+  below for what happens.
 * **Recursion.** The interpreter recurses on the native stack, so `cli.rs`
   runs it on a thread with a 1 GiB stack (reserved address space, not
   memory); if that much cannot be reserved (`ulimit -v`), it tries 256, 64
@@ -433,8 +429,9 @@ These are rejected while parsing, so even code that never runs (`if (0)
   no letter after them (`%l|`) the last modifier is taken as an unknown
   conversion letter and the text is copied verbatim, as gawk does.
 * Already agreeing with pyawk v1.1, now with tests: `-v NF=3` just sets NF
-  (BEGIN sees 3, the first record recomputes it); very deep nesting is a
-  syntax error with exit status 2; a repeat count above 32767, or a regex
+  (BEGIN sees 3, the first record recomputes it); very deep nesting stops
+  with exit status 2 (since stage 3 with pyawk's message, "program is
+  nested too deeply"); a repeat count above 32767, or a regex
   needing more than `NFA_LIMIT` automaton states, is a bad regex; `[z-a]`
   is invalid, `[a-c-e]` reads as mawk does (`a-c`, `-`, `e`) and `a+?` is
   `(a+)?`.
@@ -456,3 +453,69 @@ so skipping it *uses it up* (`RecordReader::use_up`): a later `-` operand
 or `getline < "-"` finds nothing (mawk, gawk; onetrue-awk carries on).
 The rest is not read first, which could block on a terminal.
 
+### I/O (stage 3)
+
+The audit followed pyawk v1.1's I/O checklist and decision table item by
+item (probes against pyawk v1.1 plus `tests/io.rs`, which runs the binary
+with real pipes, `/dev/full` and signals). What changed:
+
+* **getline.** `cmd | getline` leaves NR alone (all three references,
+  against POSIX's text). `getline < dir` returns -1, and a directory
+  operand stops the run with "cannot open DIR (Is a directory)", as for a
+  missing file (pyawk, mawk, gawk; onetrue skips it).
+* **Null names.** An empty file or command name in getline or a
+  redirection is fatal: "null file name in print redirection" and the
+  like (`IoManager::check_name`).
+* **`-` for output** is a file called `-` (mawk, onetrue); for input it
+  is standard input.
+* **Special names.** `/dev/stdout`, `/dev/stderr`, `-` and `/dev/stdin`
+  are remembered once used (`specials_used`). `close()` of one in use
+  returns 0: for `/dev/stdout` and `/dev/stderr` it flushes and output
+  carries on (gawk; onetrue and mawk lose stdout, which is never useful);
+  for stdin it *uses it up*, so later reads find nothing (all agree).
+  `close()` of a special never used returns -1, like any name not open
+  (gawk). All names for standard input share one reader, so `getline <
+  "-"`, `getline < "/dev/stdin"` and plain getline read consecutive lines
+  (onetrue; the others lose lines to separate buffers).
+* **close() and exit order.** `close()` of a command does not flush our
+  stdout first; at exit, commands are closed before stdout is flushed
+  (mawk, gawk). `close()` of a command returns its exit status, 256 + N
+  for a signal (the owner's decision, recorded in pyawk's DECISIONS).
+* **fflush.** `fflush()` and `fflush("")` flush everything; `fflush(name)`
+  flushes only that output and returns -1 if it is not open for output.
+  `system()` flushes everything before running.
+* **Write errors.** A failed flush of a file or of `/dev/stderr` stops
+  the run with "write error
+  on NAME (reason)", exit status 2, wherever it happens (`close()`,
+  `fflush()`, or exit): the data is lost. Standard output is the
+  exception, following onetrue (the majority on each point): a failed
+  flush of stdout makes `fflush()` return -1 and the program carries on;
+  at exit hawk reports "write error on standard output (reason)" and
+  exits 2, even after `exit 3`. When standard error itself cannot be
+  written, hawk still exits 2 and drops the message: `eprintln!` would
+  panic there, so `cli.rs` writes messages with a `report` function that
+  ignores the failure.
+* **Broken pipe.** When the reader of our stdout goes away (also at the
+  final flush), or a command we print to exits while we are still writing
+  to it (`print | "head -1"` in a loop), hawk dies of SIGPIPE: no
+  message, and the shell sees status 141, as for any C program. Only at
+  `close()` (or exit) is a command that stopped reading not an error:
+  the rest of its buffer is dropped and `close()` returns its status. The Rust runtime ignores SIGPIPE at
+  start-up, so the write fails with `BrokenPipe` instead; `cli.rs` then
+  restores the default action and raises the signal with two libc
+  functions, `signal` and `raise`, declared in an `unsafe extern "C"`
+  block. This is hawk's only `unsafe` code; it is a call into the C
+  library every Rust program already links, not a crate.
+* **Ctrl-C** kills hawk by SIGINT, so the shell sees 130, as with the C
+  awks. pyawk instead catches it and exits with code 130; a signal death
+  is better for shells and scripts (a loop around hawk stops on Ctrl-C),
+  so hawk keeps the default. **Flagged decision.**
+* **ENVIRON** was already right: values are strnums, so ` 42 ` and `1e2`
+  compare as numbers, but `0x1A` is a string (onetrue and mawk; gawk
+  reads hex), values are not escape-processed, and child processes see
+  the original environment even after ENVIRON is changed.
+
+Unchanged and confirmed: getline's NR/FNR rules, `>` truncating once per
+name, the redirection-target and `cmd | getline` precedence rules,
+`"echo " "hi" | getline` running `echo hi`, and stdout not being flushed
+before every getline (mawk, gawk).
