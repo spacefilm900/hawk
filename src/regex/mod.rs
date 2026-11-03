@@ -45,7 +45,7 @@ use std::cell::RefCell;
 
 use crate::error::Error;
 use dfa::{ACCEPT, ACCEPT_END, DEAD, Dfa};
-pub use nfa::NFA_LIMIT;
+pub use nfa::{NFA_LIMIT, limit as nfa_limit};
 pub use parse::DUP_MAX;
 use parse::{Node, parse_mode};
 
@@ -81,9 +81,10 @@ impl Regex {
         let parsed = parse_mode(src, utf8)?;
         let tree = parsed.node;
         let size = nfa::size(&tree);
-        if size > NFA_LIMIT {
+        let limit = nfa::limit(utf8);
+        if size > limit {
             return Err(Error::Runtime(format!(
-                "bad regular expression /{}/: too big (needs more than {NFA_LIMIT} automaton states)",
+                "bad regular expression /{}/: too big (needs more than {limit} automaton states)",
                 String::from_utf8_lossy(src)
             )));
         }
@@ -617,6 +618,13 @@ mod tests {
         assert_eq!(f.find(1), Some((3, 4)));
         assert_eq!(f.find(2), Some((3, 4)));
         assert_eq!(f.find(4), None);
+        // A character set is many byte states, so UTF-8 mode allows more.
+        assert!(Regex::with_mode(b".{32767}", true).is_ok());
+        let err = Regex::with_mode(b"[[:alpha:]]{4000}", true).err().unwrap();
+        assert!(
+            err.to_string()
+                .ends_with("too big (needs more than 4000000 automaton states)")
+        );
         // An empty match inside a character is never reported.
         let r = ure(br"\351*");
         let mut f = Finder::new(&r, "é".as_bytes());

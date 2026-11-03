@@ -12,6 +12,17 @@ use super::parse::{ByteSet, Node};
 /// refused cheaply instead of eating memory.
 pub const NFA_LIMIT: u64 = 1_000_000;
 
+/// The limit in UTF-8 mode.  There one character set is many byte states
+/// (`.` is 35, `[[:alpha:]]` about 1,100), where pyawk counts it as one, so
+/// the limit is four times higher: `.{32767}` still compiles, as it does
+/// in C mode.  At about 40 bytes a state that is at most some 160 MB.
+pub const NFA_LIMIT_UTF8: u64 = 4 * NFA_LIMIT;
+
+/// The state limit for a mode.
+pub fn limit(utf8: bool) -> u64 {
+    if utf8 { NFA_LIMIT_UTF8 } else { NFA_LIMIT }
+}
+
 /// One NFA instruction.  `u32` indexes keep it small.
 #[derive(Clone, Debug)]
 pub enum Inst {

@@ -31,7 +31,7 @@ use crate::input::{RecordReader, RegexFinder};
 use crate::io::{Io, strerror};
 use crate::lexer::{Builtin, process_escapes};
 use crate::rand::Random;
-use crate::regex::{Finder, NFA_LIMIT, Regex};
+use crate::regex::{Finder, Regex, nfa_limit};
 use crate::subst::{split_regex, substitute};
 use crate::value::{Value, compare, empty, num_to_str};
 
@@ -198,7 +198,8 @@ pub struct Interp<'p> {
 
     /// Compiled regexes by source text, for /literals/ and dynamic ones
     /// alike.  Capped like pyawk's cache: at most REGEX_CACHE_ENTRIES
-    /// entries and NFA_LIMIT NFA states in all; when full it starts over.
+    /// entries and NFA_LIMIT NFA states in all (four times that in UTF-8
+    /// mode); when full it starts over.
     regexes: FxMap<Vec<u8>, Rc<Regex>>,
     regex_states: u64,
 
@@ -632,7 +633,9 @@ impl<'p> Interp<'p> {
             return Ok(re.clone());
         }
         let re = Rc::new(Regex::with_mode(src, self.utf8)?);
-        if self.regexes.len() >= REGEX_CACHE_ENTRIES || self.regex_states + re.size() > NFA_LIMIT {
+        if self.regexes.len() >= REGEX_CACHE_ENTRIES
+            || self.regex_states + re.size() > nfa_limit(self.utf8)
+        {
             self.regexes.clear();
             self.regex_states = 0;
         }
