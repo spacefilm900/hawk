@@ -51,23 +51,30 @@ tools/run_corpus.py [-v] [--diff] [CATEGORY | CATEGORY/NAME ...]
 tools/regex_check.py [--show N]
 ```
 
-* `tests/corpus/golden/` is pyawk's golden corpus: 99 cases in 9 categories.
-  The expected output comes from the reference awks.
+* `tests/corpus/golden/` is pyawk v1.1's golden corpus: 154 cases in 14
+  categories. The expected output comes from the reference awks. The `utf8`
+  category runs with `LC_ALL=C.UTF-8`, the rest with `LC_ALL=C`; a
+  `NAME.environ` file adds environment variables, and each golden case runs
+  in a throwaway copy of its directory.
 * `tests/corpus/onetrue/` and `tests/corpus/gawk/` are the test suites
   imported from onetrue-awk and GNU awk. `MANIFEST.tsv` marks each case to
   run, to compare in sorted order, or to skip.
 * `tests/corpus/regex_differential.json` records the majority answer of mawk,
   onetrue-awk and `gawk --posix` for 570 regex patterns (13,503 lines).
+  This table is a hard gate: every line must agree.
+* `tests/corpus/regex_differential_utf8.json` does the same for 88 patterns
+  on UTF-8 text (2,152 lines, onetrue-awk and `gawk --posix` under
+  `LC_ALL=C.UTF-8`).
 
 How the runners judge progress: `tests/corpus/PASSING` and `REGEX_PASSING`
 list the cases hawk passed last time. A run fails only if one of those cases
 fails now, which is a regression. After an improvement, record it with
 `--update-passing`. Each runner takes `--awk CMD` to test another awk
-instead. That is how the harness itself was checked: pyawk passes 504 of
-504 corpus cases and 570 of 570 regex patterns.
+instead. That is how the harness itself was checked: pyawk v1.1 passes 561
+of 561 corpus cases (121 skipped) and agrees on all 15,655 regex lines.
 
 `tools/ast_check.py` compares hawk's parse of every corpus program with
-pyawk v1.0's, using the hidden `hawk --dump-ast` flag (regress.sh runs it
+pyawk v1.1's, using the hidden `hawk --dump-ast` flag (regress.sh runs it
 when a pyawk checkout sits next to this repository, and says so when it
 skips it).
 

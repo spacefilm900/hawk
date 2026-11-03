@@ -1,6 +1,6 @@
 """Print pyawk's parse tree of an AWK program in hawk's canonical dump format.
 
-Used by tools/ast_check.py to compare hawk's parser with pyawk v1.0's.
+Used by tools/ast_check.py to compare hawk's parser with pyawk v1.1's.
 The format (see ``dump_program`` in src/ast.rs): ``Node(field, ...)`` with
 the dataclass fields in order; strings quoted with ``\\xNN`` escapes for
 bytes outside printable ASCII; integral numbers below 1e15 as integers,
@@ -20,7 +20,9 @@ import sys
 
 def quoted(s: str) -> str:
     out = ['"']
-    for b in s.encode("utf-8", "surrogateescape"):
+    # pyawk v1.1 in the C locale holds byte N as the character U+00NN
+    # (Latin-1), both for source text and for escapes like "\303".
+    for b in s.encode("latin-1"):
         if b == 0x22:
             out.append('\\"')
         elif b == 0x5C:
@@ -63,8 +65,10 @@ def main() -> int:
     from pyawk.errors import AwkError
     from pyawk.parser import parse
 
-    with open(sys.argv[2], encoding="utf-8", errors="surrogateescape") as f:
-        source = f.read()
+    # pyawk v1.1's CLI decodes the program with the locale's codec, which
+    # is Latin-1 in the C locale (one character per byte).
+    with open(sys.argv[2], "rb") as f:
+        source = f.read().decode("latin-1")
     try:
         print(dump(parse(source)))
     except AwkError as exc:

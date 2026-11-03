@@ -1,17 +1,17 @@
-"""Compare hawk's parser with pyawk v1.0's on every corpus program.
+"""Compare hawk's parser with pyawk v1.1's on every corpus program.
 
 For each ``*.awk`` file in tests/corpus, run ``hawk --dump-ast -f FILE`` and
-pyawk v1.0's parser (through tools/ast_dump.py) and compare:
+pyawk v1.1's parser (through tools/ast_dump.py) and compare:
 
 * both parse and the trees are identical: ``same``;
 * both reject the program: ``both-reject`` (the message is compared too,
   and a different message is listed but not counted as a failure);
-* a program listed in ``DELIBERATE`` (hawk differs from pyawk v1.0 on
+* a program listed in ``DELIBERATE`` (hawk differs from pyawk v1.1 on
   purpose, see DESIGN.md) must be accepted by hawk and rejected by pyawk:
   ``deliberate``;
 * anything else is a mismatch, printed and counted; exit status 1.
 
-pyawk v1.0 is taken from the pyawk repository's ``v1.0`` tag with
+pyawk v1.1 is taken from the pyawk repository's ``v1.1`` tag with
 ``git archive`` into a temporary directory (nothing in that repository is
 changed).  Usage::
 
@@ -31,17 +31,35 @@ from pathlib import Path
 from corpus import CORPUS, DEFAULT_HAWK, REPO
 
 
-# Programs where hawk's parse differs from pyawk v1.0 on purpose (hawk
+# The pyawk release whose parser hawk is compared with.
+PYAWK_TAG = "v1.1"
+
+# Programs where hawk's parse differs from pyawk v1.1 on purpose (hawk
 # accepts, pyawk rejects).  Each entry names its DESIGN.md section.
-DELIBERATE = {
-    # "cmd | getline x + 1": DESIGN.md, "getline result in arithmetic".
-    "gawk/getline.awk",
+DELIBERATE: set[str] = set()
+# (pyawk v1.0 rejected "cmd | getline x + 1" in gawk/getline.awk; v1.1
+# parses it the way hawk does, so that entry is gone.)
+
+# Programs that pyawk v1.1 parses differently because hawk has not caught
+# up yet (the v1.1 port in progress on branch ``enhancements``).  They are
+# listed, not counted as failures; each stage empties its part.
+PENDING = {
+    # stage 1: builtin argument counts (3-argument match)
+    "gawk/rebrackloc.awk",
+    # stage 2: nextfile
+    "golden/nextfile/assignment_operands.awk",
+    "golden/nextfile/first_lines.awk",
+    "golden/nextfile/in_loops.awk",
+    "golden/nextfile/ranges.awk",
+    "golden/nextfile/skip_rest.awk",
+    "golden/nextfile/stdin_used_up.awk",
+    "golden/nextfile/with_getline.awk",
 }
 
 
 def extract_pyawk(repo: Path, dest: Path) -> None:
     data = subprocess.run(
-        ["git", "-C", str(repo), "archive", "--format=tar", "v1.0", "pyawk"],
+        ["git", "-C", str(repo), "archive", "--format=tar", PYAWK_TAG, "pyawk"],
         check=True,
         capture_output=True,
     ).stdout
@@ -86,7 +104,7 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(compare, programs))
 
-    same = both_reject = msg_diff = deliberate = 0
+    same = both_reject = msg_diff = deliberate = pending = 0
     mismatches = []
     for prog, h, p in results:
         name = prog.relative_to(CORPUS)
@@ -102,14 +120,22 @@ def main() -> int:
             msg_diff += 1
             if args.verbose:
                 print(f"message differs: {name}\n  hawk:  {h}\n  pyawk: {p}")
+        elif str(name) in PENDING:
+            pending += 1
+            if args.verbose:
+                print(f"pending: {name}")
         else:
             mismatches.append(name)
             print(f"MISMATCH {name}\n  hawk:  {h[:400]}\n  pyawk: {p[:400]}")
     print(
         f"{len(results)} programs: {same} same tree, {both_reject} rejected by both "
         f"({msg_diff} with a different message), {deliberate} deliberate differences, "
-        f"{len(mismatches)} mismatches"
+        f"{pending} pending, {len(mismatches)} mismatches"
     )
+    fixed = sorted(n for n in PENDING if n not in {str(m) for m in mismatches} and
+                   any(str(r[0].relative_to(CORPUS)) == n and r[1] == r[2] for r in results))
+    if fixed:
+        print("no longer pending (remove from PENDING): " + ", ".join(fixed))
     return 1 if mismatches else 0
 
 

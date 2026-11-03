@@ -569,3 +569,8 @@ random:c{2,}|(.$|a+)
 random:c|(ba).((b))
 random:c|[ab]
 random:c|[ab]((a|ab*)?|(.a)c+|.)*a
+utf8-brackets:[[=é=]]
+utf8-classes:[[:cntrl:]]
+utf8-dot:.*
+utf8-dot:x.
+utf8-escapes:\xc3\xa9

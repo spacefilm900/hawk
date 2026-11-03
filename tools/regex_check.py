@@ -10,12 +10,17 @@ regex corpus, the majority answer of mawk, onetrue-awk and gawk --posix
 split() with that pattern on each input line.  ``null`` lines are three-way
 splits and are not checked.  No reference awk is needed here.
 
-Each pattern counts as one case.  Like run_corpus.py, the exit status is
-1 only for a regression against tests/corpus/REGEX_PASSING.
+tests/corpus/regex_differential_utf8.json (pyawk v1.1) is the same kind
+of record for a UTF-8 corpus (categories ``utf8-...``), run under
+LC_ALL=C.UTF-8 and voted by onetrue-awk and gawk --posix only, because
+mawk works on bytes.
 
-Note: the record follows pyawk v1.1's POSIX regex decisions
-(collating symbols, equivalence classes, ...); hawk's v1.0 scope does not
-promise all of them, which is why only regressions fail the run.
+Each pattern counts as one case.  The exit status is 1 when
+
+* any line of a *gated* table disagrees (HARD_GATES: the C table is a hard
+  gate since the v1.1 work started, the UTF-8 table becomes one once
+  hawk's UTF-8 mode is in), or
+* a pattern listed in tests/corpus/REGEX_PASSING fails (a regression).
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import corpus  # noqa: E402
 
 RECORD = corpus.CORPUS / "regex_differential.json"
+RECORD_UTF8 = corpus.CORPUS / "regex_differential_utf8.json"
+# Which tables must agree on every line ("c" and/or "utf8").
+HARD_GATES = {"c"}
 PASSING = corpus.CORPUS / "REGEX_PASSING"
 ERROR = "ERROR"
 
@@ -50,9 +58,18 @@ def probe_program(pattern: str) -> str:
     ).replace("P", p)
 
 
+def table_of(rec: dict) -> str:
+    """"utf8" for an entry of the UTF-8 record, "c" otherwise."""
+    return "utf8" if rec["category"].startswith("utf8") else "c"
+
+
+def locale_of(rec: dict) -> str:
+    return "C.UTF-8" if table_of(rec) == "utf8" else "C"
+
+
 def run_probe(awk: list[str], rec: dict) -> list[str]:
     data = "".join(line + "\n" for line in rec["inputs"]).encode("utf-8", "surrogateescape")
-    env = dict(os.environ, LC_ALL="C")
+    env = dict(os.environ, LC_ALL=locale_of(rec))
     try:
         proc = subprocess.run([*awk, probe_program(rec["pattern"])], input=data, capture_output=True,
                               timeout=20, env=env)
@@ -77,7 +94,7 @@ def main() -> int:
             return 2
         awk[0] = str(Path(awk[0]).resolve())
 
-    records = json.loads(RECORD.read_text())["records"]
+    records = json.loads(RECORD.read_text())["records"] + json.loads(RECORD_UTF8.read_text())["records"]
 
     def check(rec: dict) -> tuple[dict, list[tuple[str, str, str]]]:
         got = run_probe(awk, rec)
@@ -87,6 +104,8 @@ def main() -> int:
     per_cat: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [patterns ok, patterns failing]
     lines_ok = lines_bad = shown = 0
     passing_now: set[str] = set()
+    failing_gated: list[str] = []
+    per_table: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [lines agree, lines mismatch]
     with ThreadPoolExecutor(opts.jobs) as pool:
         for rec, bad in pool.map(check, records):
             key = f"{rec['category']}:{rec['pattern']}"
@@ -94,8 +113,12 @@ def main() -> int:
             lines_bad += len(bad)
             lines_ok += checked - len(bad)
             per_cat[rec["category"]][0 if not bad else 1] += 1
+            per_table[table_of(rec)][0] += checked - len(bad)
+            per_table[table_of(rec)][1] += len(bad)
             if not bad:
                 passing_now.add(key)
+            elif table_of(rec) in HARD_GATES:
+                failing_gated.append(key)
             for inp, exp, g in bad:
                 if shown < opts.show:
                     print(f"/{rec['pattern']}/ on {inp!r}: expected {exp!r}, got {g!r}")
@@ -106,6 +129,9 @@ def main() -> int:
         print(f"{cat:<24} {ok:>5} {bad:>5}")
     print(f"{'TOTAL':<24} {len(passing_now):>5} {len(records) - len(passing_now):>5}")
     print(f"lines: {lines_ok} agree, {lines_bad} mismatch")
+    for table, (ok, bad) in sorted(per_table.items()):
+        gate = "hard gate" if table in HARD_GATES else "regressions only"
+        print(f"  {table} table: {ok} agree, {bad} mismatch ({gate})")
 
     baseline = corpus.read_passing(PASSING)
     regressions = sorted(baseline - passing_now)
@@ -118,10 +144,14 @@ def main() -> int:
             return 2
         corpus.write_passing(PASSING, passing_now, "regex patterns")
         print(f"wrote {len(passing_now)} keys to {PASSING.relative_to(corpus.REPO)}")
+    status = 0
     if regressions:
         print(f"\nREGRESSIONS ({len(regressions)}): " + ", ".join(regressions[:50]))
-        return 1
-    return 0
+        status = 1
+    if failing_gated:
+        print(f"\nGATE FAILED ({len(failing_gated)}): " + ", ".join(sorted(failing_gated)[:50]))
+        status = 1
+    return status
 
 
 if __name__ == "__main__":

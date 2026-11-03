@@ -17,6 +17,13 @@ Rust idioms the code relies on. The notes are for readers who know
 programming well but not Rust. Decisions that hawk takes differently from
 pyawk v1.0 are listed at the end.
 
+**v1.1 extras (branch `enhancements`).** hawk is being brought up to pyawk
+v1.1: the POSIX parse-time errors, `nextfile`, the I/O and `getline` audit
+with `ENVIRON`, and UTF-8 locales. Their decisions are pyawk v1.1's, in
+[docs/pyawk-v1.1-DESIGN.md](docs/pyawk-v1.1-DESIGN.md) (a copy of pyawk's
+DESIGN.md at tag `v1.1`); "Porting pyawk v1.1" near the end of this file
+records how hawk implements them and any question pyawk left open.
+
 ## Pipeline
 
 ```text
@@ -328,8 +335,8 @@ once hawk has found that prefix.
   `("cmd" | getline x) + 1` in hawk, as in gawk and mawk; the same holds for
   `- * / % ^`. pyawk v1.0 rejects it as a syntax error, and onetrue-awk
   reads it as a concatenation with `+1`. hawk follows the reference
-  majority (`gawk/getline.awk` in the corpus; `tools/ast_check.py` lists it
-  as a deliberate difference).
+  majority (`gawk/getline.awk` in the corpus). pyawk v1.1 made the same
+  change, so this is no longer a difference from the current pyawk.
 * **ASCII-only names.** `-v name=value`, `name=value` operands and program
   identifiers accept only ASCII letters, digits and `_`, as POSIX
   specifies. pyawk v1.0 used Python's `str.isidentifier()`, which also
@@ -373,3 +380,24 @@ once hawk has found that prefix.
   onetrue-awk do.
 * **`tolower`/`toupper`** change ASCII letters only (bytes, the C locale);
   pyawk v1.0 used Python's Unicode case mapping.
+
+## Porting pyawk v1.1
+
+### Test harness
+
+* The golden corpus has pyawk v1.1's five new categories (`environ`,
+  `io`, `nextfile`, `regex_posix`, `utf8`; 154 cases in all), its
+  `OVERRIDES` and `DECISIONS` files, and the updated onetrue/gawk
+  manifests (gawk's `close_status` and `regrange` now run).
+* `tools/corpus.py` runs cases as pyawk v1.1's harness does: `utf8` under
+  `LC_ALL=C.UTF-8` and the rest under `LC_ALL=C`; `NAME.environ` lines are
+  added to the environment (inherited `PYAWK_T_*` variables are dropped
+  first); golden cases run in a temporary copy of their directory.
+* `tools/regex_check.py` also runs the UTF-8 record. The C table is now a
+  hard gate (any disagreeing line fails the run); the UTF-8 table counts
+  only regressions until hawk has a UTF-8 mode (`HARD_GATES`).
+* `tools/ast_check.py` compares with pyawk **v1.1**'s parser. Programs it
+  parses differently only because a stage is not done yet are listed in
+  `PENDING` and reported, not failed. `tools/ast_dump.py` now decodes the
+  program as Latin-1, as pyawk v1.1 does in the C locale, so a string
+  escape such as `"\303"` dumps as the single byte it stands for.
