@@ -1612,7 +1612,7 @@ impl<'p> Interp<'p> {
             System => {
                 Self::arity(b, args, 1, 1)?;
                 let cmd = self.str_arg(&args[0])?;
-                num(self.io.system(&cmd))
+                num(self.io.system(&cmd)?)
             }
             Close => {
                 Self::arity(b, args, 1, 1)?;
@@ -1620,9 +1620,18 @@ impl<'p> Interp<'p> {
                 num(self.io.close(&name)?)
             }
             Fflush => {
+                // fflush() and fflush(""): everything (POSIX 2024; gawk and
+                // mawk); fflush(name): that output only.
                 Self::arity(b, args, 0, 1)?;
-                self.io.flush_all();
-                num(0.0)
+                let name = match args.first() {
+                    Some(a) => self.str_arg(a)?,
+                    None => Rc::from(&b""[..]),
+                };
+                if name.is_empty() {
+                    num(self.io.flush_all()?)
+                } else {
+                    num(self.io.flush(&name)?)
+                }
             }
         }
     }

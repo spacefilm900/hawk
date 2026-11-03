@@ -146,7 +146,7 @@ impl Io {
         if self.interactive && result.is_ok() {
             result = self.stdout.flush();
         }
-        result.map_err(|e| write_error(e, b"/dev/stdout"))
+        result.map_err(|e| write_error(e, b"standard output"))
     }
 
     /// Write `data` to the redirection `kind name`, opening it the first
@@ -200,7 +200,7 @@ impl Io {
         let path = OsStr::from_bytes(name);
         match kind {
             Redirect::Pipe => {
-                self.flush_all();
+                self.flush_all()?;
                 let mut child = shell(name).stdin(Stdio::piped()).spawn().map_err(fail)?;
                 // `take()` moves the pipe out of the child, leaving `None`.
                 let pipe = child.stdin.take().unwrap();
@@ -254,7 +254,7 @@ impl Io {
     pub fn input_cmd(&mut self, cmd: &[u8]) -> Result<&mut RecordReader, Error> {
         if !self.inputs.contains_key(cmd) {
             check_name(cmd, "getline")?;
-            self.flush_all();
+            self.flush_all()?;
             let mut child = shell(cmd).stdout(Stdio::piped()).spawn().map_err(|e| {
                 Error::Runtime(format!(
                     "can't open pipe {} ({})",
@@ -327,25 +327,69 @@ impl Io {
 
     /// `system(cmd)`: run a command, after flushing our own output so that
     /// the two appear in order.
-    pub fn system(&mut self, cmd: &[u8]) -> f64 {
-        self.flush_all();
-        match shell(cmd).status() {
+    pub fn system(&mut self, cmd: &[u8]) -> Result<f64, Error> {
+        self.flush_all()?;
+        Ok(match shell(cmd).status() {
             Ok(status) => wait_status(status),
             Err(_) => -1.0,
+        })
+    }
+
+    /// Flush standard output; 0, or -1 if the system refused (a full
+    /// disk, say).  The program carries on, as in mawk and onetrue-awk, and
+    /// the same failure at exit then ends it with status 2.  A broken pipe
+    /// ends the run (SIGPIPE).
+    fn flush_stdout(&mut self) -> Result<f64, Error> {
+        match self.stdout.flush() {
+            Ok(()) => Ok(0.0),
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Err(Error::BrokenPipe),
+            Err(_) => Ok(-1.0),
         }
     }
 
-    /// Flush standard output and every open output stream.
-    pub fn flush_all(&mut self) {
-        let _ = self.stdout.flush();
-        for out in self.outputs.values_mut() {
-            let _ = out.writer().flush();
+    /// `fflush()` and `fflush("")`, and the flush before starting a
+    /// command: flush standard output and every open output file or
+    /// command.  The result is standard output's (see `flush_stdout`); an
+    /// output file or command that cannot be flushed stops the program
+    /// with "write error on NAME", status 2 (onetrue-awk and gawk; mawk
+    /// returns -1).
+    pub fn flush_all(&mut self) -> Result<f64, Error> {
+        let status = self.flush_stdout()?;
+        // `iter_mut` gives (name, stream) pairs that can be changed.
+        for (name, out) in self.outputs.iter_mut() {
+            out.writer().flush().map_err(|e| write_error(e, name))?;
+        }
+        Ok(status)
+    }
+
+    /// `fflush(name)`: 0 if `name` is an open output, flushed; -1 if it is
+    /// not open for output (input files and commands included; mawk and
+    /// gawk).  If the flush fails, standard output gives -1 and the program
+    /// carries on; "/dev/stderr", a file or a command stops the program
+    /// with "write error on NAME".
+    pub fn flush(&mut self, name: &[u8]) -> Result<f64, Error> {
+        match name {
+            b"/dev/stdout" => self.flush_stdout(),
+            b"/dev/stderr" => {
+                io::stderr().flush().map_err(|e| write_error(e, name))?;
+                Ok(0.0)
+            }
+            _ => match self.outputs.get_mut(name) {
+                None => Ok(-1.0),
+                Some(out) => {
+                    out.writer().flush().map_err(|e| write_error(e, name))?;
+                    Ok(0.0)
+                }
+            },
         }
     }
 
     /// The end of the run: close every stream, then flush standard output.
-    /// Everything is closed even if one fails; the first failure is
-    /// returned.
+    /// Commands are closed (and waited for) before our own buffered output
+    /// is flushed, so a command's output comes first (mawk and gawk;
+    /// onetrue-awk flushes first).  Everything is closed even if one fails;
+    /// then the first failure is returned.  A command's exit status is not
+    /// a failure.
     pub fn close_all(&mut self) -> Result<(), Error> {
         let mut first_error = None;
         // Collect the names first: closing changes the maps being walked.
@@ -357,13 +401,15 @@ impl Io {
                 first_error.get_or_insert(e);
             }
         }
-        let flushed = self
-            .stdout
-            .flush()
-            .map_err(|e| write_error(e, b"/dev/stdout"));
+        // Our last output could not be written (a full disk, say):
+        // onetrue-awk, gawk and pyawk report it and exit with status 2.
+        self.stdout.flush().map_err(|e| match e.kind() {
+            io::ErrorKind::BrokenPipe => Error::BrokenPipe,
+            _ => Error::Runtime(format!("write error on standard output ({})", strerror(&e))),
+        })?;
         match first_error {
             Some(e) => Err(e),
-            None => flushed,
+            None => Ok(()),
         }
     }
 }

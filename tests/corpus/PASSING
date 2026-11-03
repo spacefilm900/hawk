@@ -266,6 +266,7 @@ io/close_pipe_order
 io/close_status
 io/close_values
 io/exit_pipe_then_stdout
+io/fflush_calls
 io/getline_begin
 io/getline_cmd
 io/getline_dev_stdin

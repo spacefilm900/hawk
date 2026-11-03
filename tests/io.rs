@@ -157,7 +157,6 @@ fn null_file_or_command_name_is_an_error() {
 // --------------------------------------------------------------- fflush
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn fflush_on_a_full_stdout_gives_minus_one_then_a_write_error() {
     // fflush() and fflush("/dev/stdout") report -1 and the program carries
     // on (mawk and onetrue-awk); the final flush fails with status 2.
@@ -175,7 +174,6 @@ fn fflush_on_a_full_stdout_gives_minus_one_then_a_write_error() {
 }
 
 #[test]
-#[ignore = "v1.1 stage 3: not done yet"]
 fn fflush_of_a_full_file_stops_the_program() {
     // onetrue-awk and gawk stop at the fflush (mawk returns -1).
     if full().is_none() {
