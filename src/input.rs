@@ -13,9 +13,37 @@
 //! * anything longer: a regular expression (gawk and mawk do this).
 
 use std::io::Read;
+use std::rc::Rc;
 
 use crate::error::Error;
 use crate::regex::Transcoding;
+
+/// First `needle` in `hay`, or `None`.
+///
+/// Eight bytes at a time: XOR the needle across a word and look for a
+/// zero byte. The word is built little-endian, so the lowest byte is
+/// `hay[i]` on every machine and `trailing_zeros` counts from there.
+fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
+    let mut i = 0;
+    let n = hay.len();
+    let broadcast = u64::from_le_bytes([needle; 8]);
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(hay[i..i + 8].try_into().unwrap());
+        let x = w ^ broadcast;
+        let m = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        if m != 0 {
+            return Some(i + (m.trailing_zeros() as usize / 8));
+        }
+        i += 8;
+    }
+    while i < n {
+        if hay[i] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
 
 /// How many bytes to ask the operating system for at a time.
 const CHUNK: usize = 64 * 1024;
@@ -100,8 +128,12 @@ impl RecordReader {
     }
 
     /// Take `buf[start..end]` as the record and move past `skip` more bytes.
-    fn take(&mut self, end: usize, skip: usize) -> Vec<u8> {
-        let rec = self.buf[self.start..end].to_vec();
+    ///
+    /// One copy, straight into the `Rc` the interpreter stores as `$0`.
+    /// Copying into a `Vec` first and then into the `Rc` copied every
+    /// record twice.
+    fn take(&mut self, end: usize, skip: usize) -> Rc<[u8]> {
+        let rec = Rc::from(&self.buf[self.start..end]);
         self.start = end + skip;
         rec
     }
@@ -112,7 +144,7 @@ impl RecordReader {
         &mut self,
         rs: &[u8],
         regex: Option<RegexFinder>,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<Option<Rc<[u8]>>, Error> {
         match rs.len() {
             0 => self.read_paragraph(),
             1 => self.read_byte(rs[0]),
@@ -123,11 +155,10 @@ impl RecordReader {
         }
     }
 
-    fn read_byte(&mut self, sep: u8) -> Result<Option<Vec<u8>>, Error> {
+    fn read_byte(&mut self, sep: u8) -> Result<Option<Rc<[u8]>>, Error> {
         let mut scan = self.start;
         loop {
-            // `position` finds the first index where the test is true.
-            if let Some(k) = self.buf[scan..].iter().position(|&b| b == sep) {
+            if let Some(k) = find_byte(&self.buf[scan..], sep) {
                 return Ok(Some(self.take(scan + k, 1)));
             }
             let scanned = self.buf.len() - self.start;
@@ -140,9 +171,9 @@ impl RecordReader {
     }
 
     /// Whatever is left (the last, unterminated record), if anything.
-    fn rest(&mut self) -> Option<Vec<u8>> {
+    fn rest(&mut self) -> Option<Rc<[u8]>> {
         if self.start < self.buf.len() {
-            let rec = self.buf[self.start..].to_vec();
+            let rec = Rc::from(&self.buf[self.start..]);
             self.buf.clear();
             self.trans.clear();
             self.start = 0;
@@ -152,7 +183,7 @@ impl RecordReader {
         }
     }
 
-    fn read_paragraph(&mut self) -> Result<Option<Vec<u8>>, Error> {
+    fn read_paragraph(&mut self) -> Result<Option<Rc<[u8]>>, Error> {
         loop {
             while self.start < self.buf.len() && self.buf[self.start] == b'\n' {
                 self.start += 1;
@@ -176,17 +207,17 @@ impl RecordReader {
             }
             scan = self.start + scanned;
         }
-        let mut rec = self.rest().unwrap_or_default();
+        let mut rec = self.rest().map(|r| r.to_vec()).unwrap_or_default();
         while rec.last() == Some(&b'\n') {
             rec.pop();
         }
-        Ok(Some(rec))
+        Ok(Some(Rc::from(rec)))
     }
 
     /// Regex RS: as pyawk does, read everything first (a match could
     /// otherwise be cut short at a chunk boundary).  Empty matches do not
     /// separate records.
-    fn read_regex(&mut self, find: RegexFinder) -> Result<Option<Vec<u8>>, Error> {
+    fn read_regex(&mut self, find: RegexFinder) -> Result<Option<Rc<[u8]>>, Error> {
         while self.fill()? {}
         if self.start >= self.buf.len() {
             return Ok(None);
@@ -218,7 +249,7 @@ mod tests {
         let mut r = reader(text);
         let mut out = Vec::new();
         while let Some(rec) = r.read_record(rs.as_bytes(), None).unwrap() {
-            out.push(String::from_utf8(rec).unwrap());
+            out.push(String::from_utf8(rec.to_vec()).unwrap());
         }
         out
     }
@@ -234,9 +265,29 @@ mod tests {
         let mut r = reader("axxbxc");
         let mut got = Vec::new();
         while let Some(rec) = r.read_record(b"x*", Some(&find)).unwrap() {
-            got.push(String::from_utf8(rec).unwrap());
+            got.push(String::from_utf8(rec.to_vec()).unwrap());
         }
         assert_eq!(got, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn find_byte_matches_a_plain_scan() {
+        // Every alignment, including the tail shorter than a word, and a
+        // needle in the high bit (the zero-byte trick can mishandle that).
+        for needle in [b'\n', b' ', 0u8, 0x80, 0xff] {
+            for lead in 0..16 {
+                let mut hay = vec![needle ^ 1; lead + 40];
+                for at in [0, 1, 7, 8, 9, 15, lead, lead + 3, hay.len() - 1] {
+                    if at >= hay.len() {
+                        continue;
+                    }
+                    hay[at] = needle;
+                    assert_eq!(find_byte(&hay, needle), Some(at), "needle {needle} at {at}");
+                    hay[at] = needle ^ 1;
+                }
+                assert_eq!(find_byte(&hay, needle), None);
+            }
+        }
     }
 
     #[test]
@@ -267,9 +318,9 @@ mod tests {
     #[test]
     fn rs_can_change_between_records() {
         let mut r = reader("a;b\nc\n");
-        assert_eq!(r.read_record(b";", None).unwrap().unwrap(), b"a");
-        assert_eq!(r.read_record(b"\n", None).unwrap().unwrap(), b"b");
-        assert_eq!(r.read_record(b"\n", None).unwrap().unwrap(), b"c");
+        assert_eq!(&r.read_record(b";", None).unwrap().unwrap()[..], b"a");
+        assert_eq!(&r.read_record(b"\n", None).unwrap().unwrap()[..], b"b");
+        assert_eq!(&r.read_record(b"\n", None).unwrap().unwrap()[..], b"c");
         assert_eq!(r.read_record(b"\n", None).unwrap(), None);
     }
 }

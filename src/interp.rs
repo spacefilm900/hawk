@@ -451,7 +451,7 @@ impl<'p> Interp<'p> {
         while let Some(rec) = self.next_main_record()? {
             self.bump("NR");
             self.bump("FNR");
-            self.set_record(Rc::from(rec));
+            self.set_record(rec);
             match self.run_rules() {
                 // `next` inside a function called from a pattern or an
                 // action: abandon this record's rules just the same.
@@ -521,7 +521,7 @@ impl<'p> Interp<'p> {
     // ============================================================ input
 
     /// The next record of the main input (the operands, else stdin).
-    fn next_main_record(&mut self) -> R<Option<Vec<u8>>> {
+    fn next_main_record(&mut self) -> R<Option<Rc<[u8]>>> {
         loop {
             if let Main::None = self.main
                 && !self.open_next_input()?
@@ -1734,7 +1734,7 @@ impl<'p> Interp<'p> {
             }
         };
         match place {
-            None => self.set_record(Rc::from(rec)),
+            None => self.set_record(rec),
             Some(p) => self.set_place(&p, Value::strnum(&rec))?,
         }
         Ok(Value::Num(1.0))
