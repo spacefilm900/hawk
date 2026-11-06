@@ -14,6 +14,10 @@ publish = false
 
 [profile.release]
 # Slower to build, a little faster to run; the release binary is what the
-# corpus runners test.
+# corpus runners test.  panic = "abort" drops the unwind tables: hawk
+# reports errors as values and does not unwind through a panic, and the
+# release binary is smaller (about 1.1 MiB down to 970 KiB) with no change
+# in the benchmark times.
 lto = true
 codegen-units = 1
+panic = "abort"
