@@ -102,9 +102,7 @@ fn a_function_sees_the_latest_global() {
     // map rather than the expression that last wrote it.
     assert_eq!(
         out(
-            &[
-                "function f(x) { return x + 1 } { s += $1 } END { print f(s), s }"
-            ],
+            &["function f(x) { return x + 1 } { s += $1 } END { print f(s), s }"],
             "3\n4\n"
         ),
         "8 7\n"
