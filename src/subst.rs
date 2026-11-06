@@ -119,6 +119,11 @@ pub fn substitute(re: &Regex, repl: &[u8], s: &[u8], global: bool) -> (Vec<u8>, 
 /// Where each field of `split_regex` sits in `s`: `(start, end)` byte
 /// offsets, including empty fields.  An empty `s` has no fields.
 pub fn split_regex_spans(re: &Regex, s: &[u8]) -> Vec<(usize, usize)> {
+    // `[ ]+` and `:+` are a run of one byte. Scanning for the run is the
+    // whole split; the DFA would spend most of its time deciding that.
+    if let Some(spans) = re.split_span_fast(s) {
+        return spans;
+    }
     if s.is_empty() {
         return Vec::new();
     }

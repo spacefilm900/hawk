@@ -62,6 +62,11 @@ pub struct Regex {
     first: Option<Box<[bool; 256]>>,
     /// A plain string with no operators, matched by direct search.
     literal: Option<Vec<u8>>,
+    /// `Some((set, min))` when the whole pattern is `set{min,}`: at least
+    /// `min` bytes from `set`, repeated with no upper bound. `min` 0 is
+    /// `*`. Splitting can scan for runs instead of stepping the DFA;
+    /// matching cannot, because `*` also matches the empty string.
+    repeat_set: Option<(parse::ByteSet, u32)>,
     /// Number of NFA states (for the interpreter's cache limit).
     size: u64,
     /// Compiled in UTF-8 mode (callers step by characters).
@@ -90,6 +95,7 @@ impl Regex {
             )));
         }
         let literal = literal_of(&tree);
+        let repeat_set = repeated_set(&tree);
         let mut fwd = Dfa::new(nfa::Nfa::new(&tree, false), false);
         let d = fwd.initial(false);
         let first = fwd.first_bytes(d).map(Box::new);
@@ -99,6 +105,7 @@ impl Regex {
             rev: RefCell::new(Dfa::new(nfa::Nfa::new(&tree, true), true)),
             first,
             literal,
+            repeat_set,
             size,
             utf8,
             raw: parsed.raw,
@@ -108,6 +115,29 @@ impl Regex {
     /// Was this regex compiled in UTF-8 mode?
     pub fn utf8(&self) -> bool {
         self.utf8
+    }
+
+    /// The bytes of a pattern that is only a short fixed string, if it is
+    /// one (`a`, `foo`).  Operators, classes and anything longer than 32
+    /// bytes are `None`.
+    pub fn literal_bytes(&self) -> Option<&[u8]> {
+        self.literal.as_deref()
+    }
+
+    /// Spans of `split` on this pattern, if it is a repeated byte set
+    /// (`[ ]+`, `a{2,}`, `,*`). `None` for any other pattern, and in
+    /// UTF-8 mode when the set holds a non-ASCII byte (that can sit in
+    /// the middle of a character, which the DFA already handles).
+    ///
+    /// Empty matches are not separators, so `*` splits like `+`: a run
+    /// has to be at least one byte, or `min` if `min` is larger.
+    pub fn split_span_fast(&self, s: &[u8]) -> Option<Vec<(usize, usize)>> {
+        let (set, min) = self.repeat_set?;
+        if self.utf8 && (set.0[2] != 0 || set.0[3] != 0) {
+            return None;
+        }
+        let need = min.max(1) as usize;
+        Some(split_byte_runs(set, need, s))
     }
 
     /// The text a raw regex must run on instead of `text`, if any.
@@ -450,6 +480,74 @@ enum Probe {
 /// The longest literal given to the direct search (see [`find_bytes`]).
 const MAX_LITERAL: usize = 32;
 
+/// `set{min,}` (no upper bound), if the whole pattern is that.
+fn repeated_set(tree: &Node) -> Option<(parse::ByteSet, u32)> {
+    match tree {
+        Node::Repeat(inner, min, None) => match inner.as_ref() {
+            Node::Set(set) => Some((*set, *min)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Field spans from splitting on runs of at least `need` bytes from `set`.
+fn split_byte_runs(set: parse::ByteSet, need: usize, s: &[u8]) -> Vec<(usize, usize)> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    // One byte (`[ ]+`, `:+`) is the common field separator. A plain
+    // comparison beats testing a bit in a 256-bit set.
+    if let Some(b) = set.only() {
+        return split_one_byte_runs(b, need, s);
+    }
+    let mut out = Vec::new();
+    let mut piece = 0;
+    let mut i = 0;
+    let n = s.len();
+    while i < n {
+        if !set.contains(s[i]) {
+            i += 1;
+            continue;
+        }
+        let run = i;
+        i += 1;
+        while i < n && set.contains(s[i]) {
+            i += 1;
+        }
+        if i - run >= need {
+            out.push((piece, run));
+            piece = i;
+        }
+    }
+    out.push((piece, n));
+    out
+}
+
+fn split_one_byte_runs(byte: u8, need: usize, s: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut piece = 0;
+    let mut i = 0;
+    let n = s.len();
+    while i < n {
+        if s[i] != byte {
+            i += 1;
+            continue;
+        }
+        let run = i;
+        i += 1;
+        while i < n && s[i] == byte {
+            i += 1;
+        }
+        if i - run >= need {
+            out.push((piece, run));
+            piece = i;
+        }
+    }
+    out.push((piece, n));
+    out
+}
+
 /// The bytes of a pattern that is just a short fixed string, if it is one.
 fn literal_of(tree: &Node) -> Option<Vec<u8>> {
     let lit: Option<Vec<u8>> = match tree {
@@ -472,6 +570,21 @@ fn literal_of(tree: &Node) -> Option<Vec<u8>> {
 /// bytes the work stays linear in the text.
 fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let m = needle.len();
+    if m == 1 {
+        // One byte is the common case (`gsub(/a/, ...)`).  A direct loop
+        // is what the compiler vectorizes; `position` on a fresh subslice
+        // per call does not.
+        let b = needle[0];
+        let h = &hay[from..];
+        let mut i = 0;
+        while i < h.len() {
+            if h[i] == b {
+                return Some(from + i);
+            }
+            i += 1;
+        }
+        return None;
+    }
     let first = needle[0];
     let mut i = from;
     while i + m <= hay.len() {
@@ -494,6 +607,32 @@ mod tests {
     }
     fn find(p: &str, t: &str) -> Option<(usize, usize)> {
         re(p).find_at(t.as_bytes(), 0)
+    }
+
+    #[test]
+    fn repeated_set_splits_on_runs() {
+        let spans = |pat: &str, text: &str| -> Option<Vec<(usize, usize)>> {
+            Regex::new(pat.as_bytes())
+                .unwrap()
+                .split_span_fast(text.as_bytes())
+        };
+        // Not a bare repeated set: the DFA has to do it.
+        assert!(spans("ab+", "ab").is_none());
+        assert!(spans("a|b", "ab").is_none());
+        // " a  b " -> "", "a", "b", "".
+        assert_eq!(
+            spans("[ ]+", " a  b ").unwrap(),
+            [(0, 0), (1, 2), (4, 5), (6, 6)]
+        );
+        // `*` skips empty matches, so it splits on the same runs as `+`.
+        assert_eq!(
+            spans(" *", " a  b").unwrap(),
+            spans("[ ]+", " a  b").unwrap()
+        );
+        // At least two: a single `a` stays in the field ("b" | "bxa").
+        assert_eq!(spans("a{2,}", "baabxa").unwrap(), [(0, 1), (3, 6)]);
+        // "x" | "y" | ""
+        assert_eq!(spans("[abc]+", "xabyc").unwrap(), [(0, 1), (3, 4), (5, 5)]);
     }
 
     #[test]
