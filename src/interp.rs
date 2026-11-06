@@ -26,7 +26,7 @@ use crate::array::{Array, FxMap, Key};
 use crate::ast::{BinOp, CmpOp, Expr, Function, GetlineKind, Program, Redirect, Stmt, UnOp};
 use crate::charset;
 use crate::error::Error;
-use crate::format::format_printf;
+use crate::format::{CompiledFormat, FmtArg, compile_format, format_compiled};
 use crate::input::{RecordReader, RegexFinder};
 use crate::io::{Io, strerror};
 use crate::lexer::{Builtin, process_escapes};
@@ -264,6 +264,27 @@ pub struct Interp<'p> {
     arr_ptr: *const u8,
     arr_len: usize,
     arr_cache: Option<ArrayRef>,
+
+    /// Buffer recycled across `printf` lines, so each line is not a fresh
+    /// allocation.  Taken out for the duration of one `printf` (an
+    /// argument may itself `printf`), then put back.
+    spare: Vec<u8>,
+    /// Compiled form of the format string whose bytes live at `fmt_ptr`
+    /// (a constant in the program).  The pointer is stable for the run.
+    fmt_ptr: *const u8,
+    fmt_len: usize,
+    fmt_compiled: CompiledFormat,
+
+    /// The last ordinary global read or written, kept here so `s += $2`
+    /// does not hash the name on every record.  `sc_name` is the same
+    /// letters, remembered so the value can be written back to `globals`
+    /// when a *different* expression (a different copy of the name in the
+    /// syntax tree) uses it.  Specials and arrays are not cached.
+    sc_on: bool,
+    sc_ptr: *const u8,
+    sc_len: usize,
+    sc_name: String,
+    sc_val: Value,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -366,6 +387,15 @@ impl<'p> Interp<'p> {
             arr_ptr: std::ptr::null(),
             arr_len: 0,
             arr_cache: None,
+            spare: Vec::new(),
+            fmt_ptr: std::ptr::null(),
+            fmt_len: 0,
+            fmt_compiled: CompiledFormat::default(),
+            sc_on: false,
+            sc_ptr: std::ptr::null(),
+            sc_len: 0,
+            sc_name: String::new(),
+            sc_val: Value::Uninit,
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
@@ -1056,12 +1086,61 @@ impl<'p> Interp<'p> {
 
     /// Read a global scalar.  The first read of an unset name makes it a
     /// scalar (it can no longer become an array).
+    /// Write the cached global back into the map.  Cheap when the cache
+    /// is empty; otherwise one map update.  Called when a different name,
+    /// or the same name from a different expression, is about to be used,
+    /// and before any read of the map that bypasses the cache.
+    fn store_scalar(&mut self) {
+        if !self.sc_on {
+            return;
+        }
+        let v = self.sc_val.clone();
+        if let Some(Var::Scalar(slot)) = self.globals.get_mut(self.sc_name.as_str()) {
+            *slot = v;
+        }
+    }
+
+    /// Point the cache at `name`, which is an ordinary scalar.  No work
+    /// when this expression's name is already the one cached.
+    fn touch_scalar(&mut self, name: &str) {
+        let p = name.as_ptr();
+        if self.sc_on && self.sc_ptr == p && self.sc_len == name.len() {
+            return;
+        }
+        self.store_scalar();
+        self.sc_on = false;
+        if self.special_slot(name).is_some() || name == "NF" {
+            return;
+        }
+        let v = match self.globals.get(name) {
+            Some(Var::Scalar(v)) => v.clone(),
+            // An array, or a missing name that might still become one:
+            // leave it to the caller.  A missing name used as a scalar is
+            // created below.
+            Some(Var::Array(_)) => return,
+            None => {
+                self.globals
+                    .insert(name.to_string(), Var::Scalar(Value::Uninit));
+                Value::Uninit
+            }
+        };
+        self.sc_ptr = p;
+        self.sc_len = name.len();
+        self.sc_name = name.to_string();
+        self.sc_val = v;
+        self.sc_on = true;
+    }
+
     fn get_global(&mut self, name: &str) -> R<Value> {
         if name == "NF" {
             return Ok(Value::Num(self.get_nf()?));
         }
         if let Some(v) = self.special_slot(name) {
             return Ok(v.clone());
+        }
+        self.touch_scalar(name);
+        if self.sc_on && self.sc_ptr == name.as_ptr() && self.sc_len == name.len() {
+            return Ok(self.sc_val.clone());
         }
         match self.globals.get(name) {
             Some(Var::Scalar(v)) => Ok(v.clone()),
@@ -1080,6 +1159,11 @@ impl<'p> Interp<'p> {
         }
         if let Some(slot) = self.special_slot_mut(name) {
             *slot = v;
+            return Ok(());
+        }
+        self.touch_scalar(name);
+        if self.sc_on && self.sc_ptr == name.as_ptr() && self.sc_len == name.len() {
+            self.sc_val = v;
             return Ok(());
         }
         match self.globals.get_mut(name) {
@@ -1121,6 +1205,8 @@ impl<'p> Interp<'p> {
         if name == "NF" || self.special_slot(name).is_some() {
             return rt(format!("can't use scalar {name} as array"));
         }
+        // The cached scalar, if this is its name, is the current value.
+        self.store_scalar();
         match self.globals.get(name) {
             Some(Var::Array(a)) => Ok(a.clone()),
             Some(Var::Scalar(_)) => rt(format!("can't use scalar {name} as array")),
@@ -1396,8 +1482,15 @@ impl<'p> Interp<'p> {
                     // mawk rejects it), but `printf > "f"` still opens f.
                     return self.output(redirect, b"").map(|()| Flow::Normal);
                 }
-                let text = self.sprintf(args)?;
-                self.output(redirect, &text)?;
+                // `spare` is empty while we hold `buf`, so a printf inside
+                // an argument gets its own buffer and cannot clobber this
+                // one.
+                let mut buf = std::mem::take(&mut self.spare);
+                buf.clear();
+                let wrote = self.printf_into(&mut buf, args);
+                let result = wrote.and_then(|()| self.output(redirect, &buf));
+                self.spare = buf;
+                result?;
             }
             Stmt::If { test, then, orelse } => {
                 if self.cond(test)? {
@@ -1506,14 +1599,72 @@ impl<'p> Interp<'p> {
         Ok(())
     }
 
+    /// Make `fmt_compiled` the parse of this constant format, if it is
+    /// not already.
+    fn ensure_format(&mut self, fmt: &[u8]) {
+        let p = fmt.as_ptr();
+        if self.fmt_ptr == p && self.fmt_len == fmt.len() {
+            return;
+        }
+        self.fmt_compiled = compile_format(fmt);
+        self.fmt_ptr = p;
+        self.fmt_len = fmt.len();
+    }
+
+    /// Append the printf of `args` (format first) to `out`.
+    ///
+    /// A constant format is parsed once.  `%d` and `%f` read a field as a
+    /// number, so `printf "%d", $2` does not allocate the field's text.
+    /// `%s` still needs that text.
+    fn printf_into(&mut self, out: &mut Vec<u8>, args: &'p [Expr]) -> R<()> {
+        let convfmt = self.convfmt();
+        let utf8 = self.utf8;
+        // Move the compiled pieces out of `self` so arguments can be
+        // evaluated (an argument may printf, and would use the same
+        // slot).  The move does not copy the text; putting the pieces
+        // back keeps them for the next record.
+        let (compiled, restore) = match args.first() {
+            Some(Expr::Str(fmt)) => {
+                self.ensure_format(fmt);
+                let ptr = self.fmt_ptr;
+                let len = self.fmt_len;
+                self.fmt_ptr = std::ptr::null();
+                (std::mem::take(&mut self.fmt_compiled), Some((ptr, len)))
+            }
+            Some(e) => {
+                let fmt = self.str_arg(e)?;
+                (compile_format(&fmt), None)
+            }
+            None => return Ok(()),
+        };
+        let mut i = 1; // args[0] is the format
+        let result = format_compiled(out, &compiled, &convfmt, utf8, |kind| {
+            let Some(e) = args.get(i) else {
+                i += 1;
+                // A missing argument is not an unset variable: `%c` prints
+                // nothing rather than a NUL.  "" does that, and is 0 for
+                // the numeric conversions.
+                return Ok(Value::Str(empty()));
+            };
+            i += 1;
+            Ok(match kind {
+                FmtArg::Number => Value::Num(self.eval_num(e)?),
+                FmtArg::Value | FmtArg::Char => self.eval(e)?,
+            })
+        });
+        if let Some((ptr, len)) = restore {
+            self.fmt_compiled = compiled;
+            self.fmt_ptr = ptr;
+            self.fmt_len = len;
+        }
+        result
+    }
+
     /// Evaluate `args` (the format first) and format them as printf does.
     fn sprintf(&mut self, args: &'p [Expr]) -> R<Vec<u8>> {
-        let mut vals = Vec::with_capacity(args.len());
-        for a in args {
-            vals.push(self.eval(a)?);
-        }
-        let fmt = self.to_str(&vals[0]);
-        Ok(format_printf(&fmt, &vals[1..], &self.convfmt(), self.utf8))
+        let mut out = Vec::new();
+        self.printf_into(&mut out, args)?;
+        Ok(out)
     }
 
     // ======================================================= expressions
@@ -1770,6 +1921,7 @@ impl<'p> Interp<'p> {
             if let Some(v) = self.special_slot(name) {
                 return Ok(Cell::Scalar(v.clone()));
             }
+            self.store_scalar();
             return Ok(match self.globals.get(name.as_str()) {
                 Some(Var::Array(a)) => Cell::Array(a.clone()),
                 Some(Var::Scalar(v)) => Cell::Scalar(v.clone()),
@@ -1882,6 +2034,38 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// Replace a literal in `$0` without allocating, when that is safe.
+    ///
+    /// `Some(count)` means the replacement was done (including a count of
+    /// zero: the text did not change).  `None` means the caller should
+    /// use the general substitution: the pattern is not a fixed string,
+    /// the replacement is not the same number of plain bytes (`&` and
+    /// backslashes are special), or some other value still shares the
+    /// record.  Sharing matters: `x = $0` must keep the old text when
+    /// `gsub` then changes `$0`.
+    fn replace_record_inplace(&mut self, re: &Regex, repl: &[u8], global: bool) -> Option<usize> {
+        let lit = re.literal_bytes()?;
+        if lit.len() != repl.len() || repl.contains(&b'&') || repl.contains(&b'\\') {
+            return None;
+        }
+        // Copy the pattern out of `re` before borrowing the record.
+        let lit = lit.to_vec();
+        let n = {
+            let buf = Rc::get_mut(&mut self.record)?;
+            replace_literal(buf, &lit, repl, global)
+        };
+        if n > 0 {
+            // The bytes changed, so a previous split is wrong, and `$0`
+            // is now a plain string (not a strnum), same as assigning
+            // the result of the general substitution.
+            self.fields.ready = false;
+            self.fields.owned = false;
+            let text = self.record.clone();
+            self.record_value = Some(Value::Str(text));
+        }
+        Some(n)
+    }
+
     /// Call a builtin function.  The parser has checked the argument
     /// counts; arguments are evaluated here, as each builtin needs them.
     fn builtin(&mut self, b: Builtin, args: &'p [Expr]) -> R<Value> {
@@ -1973,11 +2157,20 @@ impl<'p> Interp<'p> {
                 match args.get(2) {
                     // The default target is $0.
                     None => {
-                        let text = self.record.clone();
-                        let (out, n) = substitute(&re, &repl, &text, global);
-                        if n > 0 {
-                            self.set_field(0, Value::Str(Rc::from(out)))?;
-                        }
+                        // `gsub(/a/, "A")` replaces one byte with one byte.
+                        // If nothing else holds the record, that can be
+                        // done in the buffer it already occupies.
+                        let n = match self.replace_record_inplace(&re, &repl, global) {
+                            Some(n) => n,
+                            None => {
+                                let text = self.record.clone();
+                                let (out, n) = substitute(&re, &repl, &text, global);
+                                if n > 0 {
+                                    self.set_field(0, Value::Str(Rc::from(out)))?;
+                                }
+                                n
+                            }
+                        };
                         num(n as f64)
                     }
                     // An lvalue is resolved once (`arr[i++]` steps i once)
@@ -2074,6 +2267,45 @@ impl<'p> Interp<'p> {
             }
         }
     }
+}
+
+/// Overwrite non-overlapping occurrences of `lit` with `repl` (same
+/// length) inside `buf`.  `global` false stops after the first.  Returns
+/// how many were replaced.
+fn replace_literal(buf: &mut [u8], lit: &[u8], repl: &[u8], global: bool) -> usize {
+    if lit.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    if lit.len() == 1 {
+        let from = lit[0];
+        let to = repl[0];
+        while i < buf.len() {
+            if buf[i] == from {
+                buf[i] = to;
+                count += 1;
+                if !global {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        return count;
+    }
+    while i + lit.len() <= buf.len() {
+        if &buf[i..i + lit.len()] == lit {
+            buf[i..i + lit.len()].copy_from_slice(repl);
+            count += 1;
+            i += lit.len();
+            if !global {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// Arithmetic with AWK's error rules: division by zero is fatal; `%` is

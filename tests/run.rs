@@ -62,6 +62,27 @@ fn fields_and_records() {
 }
 
 #[test]
+fn gsub_of_dollar0_does_not_change_a_saved_copy() {
+    // The result of gsub is a string, so "1" does not compare as a
+    // number.  A copy taken before gsub keeps the original bytes.
+    assert_eq!(
+        out(
+            &["{ gsub(/a/, \"1.0\"); print ($0 == 1), ($0 == \"1.0\") }"],
+            "a\n"
+        ),
+        "0 1\n"
+    );
+    assert_eq!(
+        out(&["{ x = $0; gsub(/a/, \"A\"); print x, $0 }"], "ab a\n"),
+        "ab a Ab A\n"
+    );
+    assert_eq!(
+        out(&["{ print sub(/a/, \"A\"), $0 }"], "ab a\n"),
+        "1 Ab a\n"
+    );
+}
+
+#[test]
 fn array_increment_keeps_field_text_and_insertion_order() {
     // The key is the field's text ("010", not 10) and ++ yields the old
     // number. for-in walks in insertion order.
@@ -73,6 +94,21 @@ fn array_increment_keeps_field_text_and_insertion_order() {
         "010 2\nb 1\n"
     );
     assert_eq!(out(&["{ print ++c[$1], c[$1] }"], "a\n"), "1 1\n");
+}
+
+#[test]
+fn a_function_sees_the_latest_global() {
+    // The action and END name `s` separately, and a function reads the
+    // map rather than the expression that last wrote it.
+    assert_eq!(
+        out(
+            &[
+                "function f(x) { return x + 1 } { s += $1 } END { print f(s), s }"
+            ],
+            "3\n4\n"
+        ),
+        "8 7\n"
+    );
 }
 
 #[test]
