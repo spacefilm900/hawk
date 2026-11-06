@@ -8,11 +8,16 @@
 //! from key to position in that `Vec` (the fast lookup).  Deleting leaves a
 //! hole (`None`) that is cleaned up when holes pile up.
 //!
-//! Array keys come from input data, so the lookup map uses the standard
-//! library's hasher, which is seeded randomly per map: input crafted so its
-//! keys collide (making every lookup slow) cannot be prepared in advance.
-//! The faster, unseeded `FxMap` below is kept for variable names (chosen by
-//! the program text) and the small, capped regex cache.
+//! Array keys come from input data, so each array's lookup map is seeded
+//! randomly.  Input crafted so its keys collide (making every lookup slow)
+//! cannot be prepared in advance: the seed is not known until the array
+//! exists.  The hash itself is FxHash, which is much faster than the
+//! standard library's SipHash and, with a secret seed, still stops that
+//! precomputation.  It is not a cryptographic hash: someone who can try
+//! keys against a running program and time the answers could still hunt
+//! for a collision.  Variable names (chosen by the program text) and the
+//! small regex cache use FxHash with a fixed seed; a collision there is
+//! not interesting.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -26,9 +31,9 @@ pub type Key = Rc<[u8]>;
 /// A small, fast hash function (the "FxHash" used inside the Rust
 /// compiler).  The standard library's default hasher resists deliberate
 /// collision attacks at a cost in speed; that resistance is not needed for
-/// keys the program text chooses, such as variable names (array keys do
-/// need it; see the top of this file).  Writing our own keeps the
-/// zero-dependency rule.
+/// keys the program text chooses, such as variable names.  Array keys use
+/// the same function with a random seed (see the top of this file).
+/// Writing our own keeps the zero-dependency rule.
 #[derive(Default, Clone, Copy)]
 pub struct FxHasher(u64);
 
@@ -46,15 +51,84 @@ impl Hasher for FxHasher {
     }
 }
 
-/// A `HashMap` using `FxHasher`.
+/// Mix the high bits of an FxHash down into the low bits.
+///
+/// `HashMap` picks its bucket from the low bits.  FxHash leaves those
+/// bits unchanged for keys that differ only in the middle: the crafted
+/// keys in `colliding_keys_stay_fast` all ended in the same 24 bits, so
+/// every key landed in one bucket and inserting became quadratic.  Array
+/// keys go through this; variable names do not, because there are few of
+/// them and the extra multiplies would be paid on every lookup.
+fn avalanche(mut h: u64) -> u64 {
+    // The finalizer from MurmurHash3.
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h
+}
+
+/// FxHash with the avalanche, for array keys.
+struct SeededFx(FxHasher);
+
+impl Hasher for SeededFx {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+    fn finish(&self) -> u64 {
+        avalanche(self.0.finish())
+    }
+}
+
+/// A `HashMap` using `FxHasher` with a fixed seed (see the top of this file).
 pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
-#[derive(Default, Debug)]
+/// FxHash plus a per-array random seed.  `BuildHasher` is what `HashMap`
+/// asks for when it wants a fresh hasher; the seed is copied into it.
+#[derive(Clone)]
+struct FxBuildHasher {
+    seed: u64,
+}
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = SeededFx;
+    fn build_hasher(&self) -> SeededFx {
+        SeededFx(FxHasher(self.seed))
+    }
+}
+
+impl std::fmt::Debug for FxBuildHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FxBuildHasher")
+    }
+}
+
+/// A seed the program text cannot predict.  The standard library's
+/// `RandomState` draws one from the operating system; hashing nothing
+/// still folds that secret in, so `finish` is a random `u64`.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+#[derive(Debug)]
 pub struct Array {
-    /// `HashMap<K, V>` with no third type parameter uses the standard,
-    /// randomly seeded hasher (`RandomState`).
-    index: HashMap<Key, usize>,
+    index: HashMap<Key, usize, FxBuildHasher>,
     entries: Vec<Option<(Key, Value)>>,
+}
+
+impl Default for Array {
+    fn default() -> Array {
+        Array {
+            index: HashMap::with_hasher(FxBuildHasher {
+                seed: random_seed(),
+            }),
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for FxHasher {
@@ -89,18 +163,39 @@ impl Array {
     }
 
     /// The element, created as uninitialized if missing.
-    pub fn get_or_create(&mut self, key: &Key) -> &mut Value {
+    ///
+    /// `key` is borrowed.  A key that is already present costs no
+    /// allocation; only a new key is copied into an `Rc`.
+    pub fn get_or_create(&mut self, key: &[u8]) -> &mut Value {
         let i = match self.index.get(key) {
             Some(&i) => i,
             None => {
+                let key: Key = Rc::from(key);
                 self.entries.push(Some((key.clone(), Value::Uninit)));
                 let i = self.entries.len() - 1;
-                self.index.insert(key.clone(), i);
+                self.index.insert(key, i);
                 i
             }
         };
         // `as_mut().unwrap()`: live index entries always point at `Some`.
         &mut self.entries[i].as_mut().unwrap().1
+    }
+
+    /// `a[k] += delta`, creating a missing element as 0 first.  Returns
+    /// the number that was there before the addition, which is what
+    /// `a[k]++` yields.  The stored result is a plain number.
+    pub fn add_number(&mut self, key: &[u8], delta: f64) -> f64 {
+        if let Some(&i) = self.index.get(key) {
+            let v = &mut self.entries[i].as_mut().unwrap().1;
+            let old = v.to_num();
+            *v = Value::Num(old + delta);
+            return old;
+        }
+        let key: Key = Rc::from(key);
+        self.entries.push(Some((key.clone(), Value::Num(delta))));
+        let i = self.entries.len() - 1;
+        self.index.insert(key, i);
+        0.0
     }
 
     pub fn set(&mut self, key: &Key, v: Value) {
@@ -168,6 +263,13 @@ mod tests {
         assert!(a.contains(b"99"));
         assert!(!a.contains(b"98"));
         assert_eq!(a.get(b"99").unwrap().to_num(), 99.0);
+        let mut b = Array::new();
+        assert_eq!(b.add_number(b"b", 1.0), 0.0);
+        assert_eq!(b.add_number(b"a", 1.0), 0.0);
+        assert_eq!(b.add_number(b"b", 1.0), 1.0);
+        let got: Vec<Vec<u8>> = b.keys().iter().map(|k| k.to_vec()).collect();
+        assert_eq!(got, [b"b".to_vec(), b"a".to_vec()]);
+        assert_eq!(b.get(b"b").unwrap().to_num(), 2.0);
         a.set(&k("1"), Value::Num(1.0));
         assert_eq!(a.keys().last().unwrap().as_ref(), b"1");
     }

@@ -62,6 +62,20 @@ fn fields_and_records() {
 }
 
 #[test]
+fn array_increment_keeps_field_text_and_insertion_order() {
+    // The key is the field's text ("010", not 10) and ++ yields the old
+    // number. for-in walks in insertion order.
+    assert_eq!(
+        out(
+            &["{ c[$1]++ } END { for (k in c) print k, c[k] }"],
+            "010\nb\n010\n"
+        ),
+        "010 2\nb 1\n"
+    );
+    assert_eq!(out(&["{ print ++c[$1], c[$1] }"], "a\n"), "1 1\n");
+}
+
+#[test]
 fn arithmetic_on_fields_keeps_strnum_text() {
     // Summing uses only the number.  Printing the field still shows the
     // original text, and a non-numeric field contributes 0.

@@ -252,6 +252,18 @@ pub struct Interp<'p> {
     subsep: Value,
     nr: Value,
     fnr: Value,
+
+    /// Scratch for an array subscript, reused every time so `c[$1]++`
+    /// does not allocate a key just to look the element up.  Grown to the
+    /// longest key seen and then kept.
+    key_buf: Vec<u8>,
+    /// The global array named by the bytes at `arr_ptr` (an AST string,
+    /// stable for the whole run).  One program refers to the same array
+    /// from the same expression on every record; the pointer compare
+    /// skips the hash lookup of the name.
+    arr_ptr: *const u8,
+    arr_len: usize,
+    arr_cache: Option<ArrayRef>,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -350,6 +362,10 @@ impl<'p> Interp<'p> {
             subsep: Value::str(b"\x1c"),
             nr: Value::Num(0.0),
             fnr: Value::Num(0.0),
+            key_buf: Vec::new(),
+            arr_ptr: std::ptr::null(),
+            arr_len: 0,
+            arr_cache: None,
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
@@ -1139,8 +1155,83 @@ impl<'p> Interp<'p> {
     fn array(&mut self, name: &str) -> R<ArrayRef> {
         match self.local_index(name) {
             Some(slot) => self.cell_array(self.frames.len() - 1, slot, name),
-            None => self.global_array(name),
+            None => self.cached_global_array(name),
         }
+    }
+
+    /// `global_array`, remembering the answer for this exact name (the
+    /// pointer of the AST string, not just the letters).  A different
+    /// expression that spells the same name misses once and then hits.
+    fn cached_global_array(&mut self, name: &str) -> R<ArrayRef> {
+        let p = name.as_ptr();
+        if self.arr_ptr == p && self.arr_len == name.len() {
+            return Ok(self.arr_cache.as_ref().unwrap().clone());
+        }
+        let a = self.global_array(name)?;
+        self.arr_ptr = p;
+        self.arr_len = name.len();
+        self.arr_cache = Some(a.clone());
+        Ok(a)
+    }
+
+    /// Append one subscript's key text to `key_buf`.  A field is copied
+    /// off the record; anything else is evaluated and stringified.
+    fn append_key_piece(&mut self, e: &'p Expr) -> R<()> {
+        if let Expr::Field(index) = e {
+            let i = match index.as_ref() {
+                Expr::Num(n) => self.field_index(*n)?,
+                _ => {
+                    let v = self.eval(index)?;
+                    self.field_number(&v)?
+                }
+            };
+            return self.append_field_key(i);
+        }
+        let v = self.eval(e)?;
+        let s = self.to_str(&v);
+        self.key_buf.extend_from_slice(&s);
+        Ok(())
+    }
+
+    /// Append field `i`'s text to `key_buf`.  The text is the field as it
+    /// would print: the original bytes, or CONVFMT if the field was
+    /// assigned a number.
+    fn append_field_key(&mut self, i: usize) -> R<()> {
+        if i == 0 {
+            let rec = self.record.clone();
+            self.key_buf.extend_from_slice(&rec);
+            return Ok(());
+        }
+        self.ensure_fields()?;
+        let idx = i - 1;
+        if idx >= self.fields.values.len() {
+            return Ok(());
+        }
+        if let Some(v) = self.fields.values[idx].clone() {
+            let s = self.to_str(&v);
+            self.key_buf.extend_from_slice(&s);
+            return Ok(());
+        }
+        let (a, b) = self.fields.spans[idx];
+        let rec = self.record.clone();
+        self.key_buf.extend_from_slice(&rec[a..b]);
+        Ok(())
+    }
+
+    /// The key of `a[i, j, ...]`, written into `key_buf` (cleared first).
+    fn fill_key(&mut self, subs: &'p [Expr]) -> R<()> {
+        self.key_buf.clear();
+        if let [one] = subs {
+            return self.append_key_piece(one);
+        }
+        let sep = self.var_str("SUBSEP");
+        for (k, e) in subs.iter().enumerate() {
+            if k > 0 {
+                self.key_buf.extend_from_slice(&sep);
+            }
+            self.append_key_piece(e)?;
+        }
+        Ok(())
     }
 
     /// "array", "scalar" or "untyped", without deciding an untyped name's
@@ -1591,11 +1682,23 @@ impl<'p> Interp<'p> {
                 prefix,
                 target,
             } => {
-                let place = self.place(target)?;
-                let old = self.get_place(&place)?.to_num();
-                let new = if *incr { old + 1.0 } else { old - 1.0 };
-                self.set_place(&place, Value::Num(new))?;
-                Value::Num(if *prefix { new } else { old })
+                // `c[$1]++` is the hot shape: the subscript is usually a
+                // field, and the element usually already exists.  Building
+                // a Place would copy the key into an `Rc` on every record
+                // even when the lookup hits.
+                if let Expr::Index(name, subs) = target.as_ref() {
+                    self.fill_key(subs)?;
+                    let arr = self.array(name)?;
+                    let delta = if *incr { 1.0 } else { -1.0 };
+                    let old = arr.borrow_mut().add_number(&self.key_buf, delta);
+                    Value::Num(if *prefix { old + delta } else { old })
+                } else {
+                    let place = self.place(target)?;
+                    let old = self.get_place(&place)?.to_num();
+                    let new = if *incr { old + 1.0 } else { old - 1.0 };
+                    self.set_place(&place, Value::Num(new))?;
+                    Value::Num(if *prefix { new } else { old })
+                }
             }
             Expr::Call(b, args) => self.builtin(*b, args)?,
             Expr::UserCall(name, args) => self.call_user(name, args)?,
