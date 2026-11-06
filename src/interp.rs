@@ -215,6 +215,21 @@ pub struct Interp<'p> {
 
     /// UTF-8 mode (from `Config::utf8`).
     utf8: bool,
+
+    /// Built-in scalars the record loop reads or writes on every line
+    /// (FS, RS, NR, ...).  They are kept here instead of in `globals` so
+    /// that touching them is a field access, not a hash lookup, and so
+    /// `NR++` does not allocate a fresh key.  Every other global still
+    /// lives in the map.  A name is in at most one of the two places.
+    fs: Value,
+    rs: Value,
+    ofs: Value,
+    ors: Value,
+    ofmt: Value,
+    convfmt_v: Value,
+    subsep: Value,
+    nr: Value,
+    fnr: Value,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -296,19 +311,21 @@ impl<'p> Interp<'p> {
                 budget + (Self::stack_size(config) - budget) / 2
             },
             utf8: config.utf8,
+            // POSIX defaults.  Strings, not numbers: their text does not
+            // depend on CONVFMT (a numeric FS would; see `special_str`).
+            fs: Value::str(b" "),
+            rs: Value::str(b"\n"),
+            ofs: Value::str(b" "),
+            ors: Value::str(b"\n"),
+            ofmt: Value::str(b"%.6g"),
+            convfmt_v: Value::str(b"%.6g"),
+            subsep: Value::str(b"\x1c"),
+            nr: Value::Num(0.0),
+            fnr: Value::Num(0.0),
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
         for (name, v) in [
-            ("FS", s(" ")),
-            ("OFS", s(" ")),
-            ("ORS", s("\n")),
-            ("RS", s("\n")),
-            ("NR", n(0.0)),
-            ("FNR", n(0.0)),
-            ("SUBSEP", s("\x1c")),
-            ("CONVFMT", s("%.6g")),
-            ("OFMT", s("%.6g")),
             ("RSTART", n(0.0)),
             ("RLENGTH", n(-1.0)),
             ("FILENAME", s("")),
@@ -458,11 +475,19 @@ impl<'p> Interp<'p> {
         Ok(true)
     }
 
-    /// Add one to a numeric special variable (NR, FNR).
+    /// Add one to NR or FNR.  The result of the addition is a number, so
+    /// a string previously stored there (`NR = "hello"`) is replaced by
+    /// its numeric value plus one, which is what `NR = NR + 1` does.
     fn bump(&mut self, name: &str) {
-        let n = self.var_num(name);
-        self.globals
-            .insert(name.to_string(), Var::Scalar(Value::Num(n + 1.0)));
+        let Some(slot) = self.special_slot_mut(name) else {
+            // Only NR and FNR are bumped.  Kept so a future caller still
+            // does the obvious thing.
+            let n = self.var_num(name) + 1.0;
+            let _ = self.set_global(name, Value::Num(n));
+            return;
+        };
+        let n = slot.to_num() + 1.0;
+        *slot = Value::Num(n);
     }
 
     // ============================================================ input
@@ -777,8 +802,65 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// One of the scalars stored beside the map (see `Interp::fs`), or
+    /// `None` when `name` is an ordinary global.
+    fn special_slot(&self, name: &str) -> Option<&Value> {
+        Some(match name {
+            "FS" => &self.fs,
+            "RS" => &self.rs,
+            "OFS" => &self.ofs,
+            "ORS" => &self.ors,
+            "OFMT" => &self.ofmt,
+            "CONVFMT" => &self.convfmt_v,
+            "SUBSEP" => &self.subsep,
+            "NR" => &self.nr,
+            "FNR" => &self.fnr,
+            _ => return None,
+        })
+    }
+
+    fn special_slot_mut(&mut self, name: &str) -> Option<&mut Value> {
+        Some(match name {
+            "FS" => &mut self.fs,
+            "RS" => &mut self.rs,
+            "OFS" => &mut self.ofs,
+            "ORS" => &mut self.ors,
+            "OFMT" => &mut self.ofmt,
+            "CONVFMT" => &mut self.convfmt_v,
+            "SUBSEP" => &mut self.subsep,
+            "NR" => &mut self.nr,
+            "FNR" => &mut self.fnr,
+            _ => return None,
+        })
+    }
+
+    /// String value of a built-in scalar.
+    ///
+    /// A string or strnum is shared (an `Rc` clone, no copying of bytes).
+    /// A number is formatted now, with the CONVFMT current at this call:
+    /// `BEGIN { FS = 1/3; CONVFMT = "%.2f" }` makes FS split on `0.33`,
+    /// not on the `0.333333` it would have had when it was assigned.
+    /// CONVFMT itself, when it is a number, is formatted with `%.6g` so
+    /// this does not recurse.
+    fn special_str(&self, name: &str) -> Option<Rc<[u8]>> {
+        let n = match self.special_slot(name)? {
+            Value::Uninit => return Some(empty()),
+            Value::Str(s) | Value::StrNum(s, _) => return Some(s.clone()),
+            Value::Num(n) => *n,
+        };
+        let fmt = if name == "CONVFMT" {
+            Rc::from(&b"%.6g"[..])
+        } else {
+            self.convfmt()
+        };
+        Some(Rc::from(num_to_str(n, &fmt)))
+    }
+
     /// A global's string value (for FS, OFS, ORS, RS, SUBSEP, ...).
     fn var_str(&self, name: &str) -> Rc<[u8]> {
+        if let Some(s) = self.special_str(name) {
+            return s;
+        }
         match self.globals.get(name) {
             Some(Var::Scalar(Value::Num(n))) => {
                 let fmt = if name == "CONVFMT" {
@@ -794,6 +876,9 @@ impl<'p> Interp<'p> {
     }
 
     fn var_num(&self, name: &str) -> f64 {
+        if let Some(v) = self.special_slot(name) {
+            return v.to_num();
+        }
         match self.globals.get(name) {
             Some(Var::Scalar(v)) => v.to_num(),
             _ => 0.0,
@@ -812,6 +897,9 @@ impl<'p> Interp<'p> {
         if name == "NF" {
             return Ok(Value::Num(self.get_nf()?));
         }
+        if let Some(v) = self.special_slot(name) {
+            return Ok(v.clone());
+        }
         match self.globals.get(name) {
             Some(Var::Scalar(v)) => Ok(v.clone()),
             Some(Var::Array(_)) => rt(format!("can't use array {name} in scalar context")),
@@ -826,6 +914,10 @@ impl<'p> Interp<'p> {
     fn set_global(&mut self, name: &str, v: Value) -> R<()> {
         if name == "NF" {
             return self.set_nf(&v);
+        }
+        if let Some(slot) = self.special_slot_mut(name) {
+            *slot = v;
+            return Ok(());
         }
         match self.globals.get_mut(name) {
             Some(Var::Array(_)) => rt(format!("can't assign to {name}; it's an array name")),
@@ -863,10 +955,12 @@ impl<'p> Interp<'p> {
 
     /// The global array `name`, created empty on first use.
     fn global_array(&mut self, name: &str) -> R<ArrayRef> {
+        if name == "NF" || self.special_slot(name).is_some() {
+            return rt(format!("can't use scalar {name} as array"));
+        }
         match self.globals.get(name) {
             Some(Var::Array(a)) => Ok(a.clone()),
             Some(Var::Scalar(_)) => rt(format!("can't use scalar {name} as array")),
-            None if name == "NF" => rt("can't use scalar NF as array"),
             None => {
                 let a: ArrayRef = Rc::default();
                 self.globals.insert(name.to_string(), Var::Array(a.clone()));
@@ -922,10 +1016,12 @@ impl<'p> Interp<'p> {
     }
 
     fn global_kind(&self, name: &str) -> Option<Option<ArrayRef>> {
+        if name == "NF" || self.special_slot(name).is_some() {
+            return None; // a scalar, already decided
+        }
         match self.globals.get(name) {
             Some(Var::Array(a)) => Some(Some(a.clone())),
             Some(Var::Scalar(_)) => None,
-            None if name == "NF" => None,
             None => Some(None),
         }
     }
@@ -1381,10 +1477,15 @@ impl<'p> Interp<'p> {
                     Cell::Untyped(_) => Cell::Untyped(Some(Link::Local(frame, slot))),
                 });
             }
+            if name == "NF" {
+                return Ok(Cell::Scalar(Value::Num(self.get_nf()?)));
+            }
+            if let Some(v) = self.special_slot(name) {
+                return Ok(Cell::Scalar(v.clone()));
+            }
             return Ok(match self.globals.get(name.as_str()) {
                 Some(Var::Array(a)) => Cell::Array(a.clone()),
                 Some(Var::Scalar(v)) => Cell::Scalar(v.clone()),
-                None if name == "NF" => Cell::Scalar(Value::Num(self.get_nf()?)),
                 None => Cell::Untyped(Some(Link::Global(name.clone()))),
             });
         }

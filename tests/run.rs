@@ -62,6 +62,40 @@ fn fields_and_records() {
 }
 
 #[test]
+fn specials_round_trip_and_numeric_fs_uses_current_convfmt() {
+    // A string assigned to NR stays a string until a record bumps it,
+    // and the bump is arithmetic: "hello" counts as 0, so the first
+    // record makes NR 1.
+    assert_eq!(
+        out(
+            &["BEGIN { NR = \"hello\"; FS = \":\"; OFS = \",\" } END { print NR, FS }"],
+            ""
+        ),
+        "hello,:\n"
+    );
+    assert_eq!(
+        out(&["BEGIN { NR = \"hello\" } { print NR }"], "a\n"),
+        "1\n"
+    );
+    // FS assigned as a number is stringified with the CONVFMT in force
+    // when the record is split, including a CONVFMT set afterwards.
+    assert_eq!(
+        out(
+            &["BEGIN { FS = 1/3; CONVFMT = \"%.2f\" } { print NF, $1, $2 }"],
+            "a0.33b\n"
+        ),
+        "2 a b\n"
+    );
+    assert_eq!(
+        out(
+            &["BEGIN { CONVFMT = \"%.2f\"; FS = 1/3 } { print NF, $1, $2 }"],
+            "a0.33b\n"
+        ),
+        "2 a b\n"
+    );
+}
+
+#[test]
 fn assignments_from_the_command_line() {
     assert_eq!(
         out(&["-v", "x=10", "BEGIN { print x + 1, (x < 9) }"], ""),
