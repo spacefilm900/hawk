@@ -157,31 +157,91 @@ fn parse_number(s: &[u8]) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// A plain integer at the start of `s` (optional sign, then digits, and
+/// not the start of a float: no `.` or `e` next).  `Some(value, length)`.
+///
+/// Only integers that are exactly representable as `f64` (up to 2^53) take
+/// this path.  Longer digit strings, and anything with a fraction or an
+/// exponent, return `None` so the `strtod`-compatible parser can round them.
+/// That parser is much slower: it checks UTF-8 and then runs the general
+/// float conversion, which is wasted work on a field like `42`.
+fn int_prefix(s: &[u8]) -> Option<(f64, usize)> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let neg = match s[0] {
+        b'+' => {
+            i = 1;
+            false
+        }
+        b'-' => {
+            i = 1;
+            true
+        }
+        _ => false,
+    };
+    if i >= s.len() || !s[i].is_ascii_digit() {
+        return None;
+    }
+    // 2^53.  Past this, not every integer has its own f64, so rounding
+    // has to be strtod's and not a cast from u64.
+    const EXACT_MAX: u64 = 1 << 53;
+    let mut n: u64 = 0;
+    while i < s.len() && s[i].is_ascii_digit() {
+        let d = (s[i] - b'0') as u64;
+        if n > (EXACT_MAX - d) / 10 {
+            return None;
+        }
+        n = n * 10 + d;
+        i += 1;
+    }
+    // "1." and "1e2" and "1e" are numbers, but not plain integers.
+    if i < s.len() && matches!(s[i], b'.' | b'e' | b'E') {
+        return None;
+    }
+    let v = if neg { -(n as f64) } else { n as f64 };
+    Some((v, i))
+}
+
+/// The number at the start of `s` (no leading whitespace) and how many
+/// bytes it occupied.  The length is 0 when there is no number.
+fn parse_prefix(s: &[u8]) -> (f64, usize) {
+    if let Some(got) = int_prefix(s) {
+        return got;
+    }
+    let len = number_prefix_len(s);
+    if len == 0 {
+        (0.0, 0)
+    } else {
+        (parse_number(&s[..len]), len)
+    }
+}
+
 /// String to number the way `strtod` reads it: skip leading whitespace,
 /// take the longest numeric prefix, 0 if there is none.
 pub fn str_to_num(s: &[u8]) -> f64 {
-    let start = s.iter().position(|&b| !is_space(b)).unwrap_or(s.len());
-    let rest = &s[start..];
-    let len = number_prefix_len(rest);
-    if len == 0 {
-        0.0
-    } else {
-        parse_number(&rest[..len])
+    let mut start = 0;
+    while start < s.len() && is_space(s[start]) {
+        start += 1;
     }
+    parse_prefix(&s[start..]).0
 }
 
 /// `Some(value)` when the *whole* of `s` is a number, allowing whitespace
 /// on both sides (POSIX's "numeric string"); `None` otherwise.
 pub fn looks_numeric(s: &[u8]) -> Option<f64> {
-    let start = s.iter().position(|&b| !is_space(b))?;
-    let end = s.iter().rposition(|&b| !is_space(b))? + 1;
-    let text = &s[start..end];
-    let len = number_prefix_len(text);
-    if len > 0 && len == text.len() {
-        Some(parse_number(text))
-    } else {
-        None
+    let mut start = 0;
+    while start < s.len() && is_space(s[start]) {
+        start += 1;
     }
+    let mut end = s.len();
+    while end > start && is_space(s[end - 1]) {
+        end -= 1;
+    }
+    let text = &s[start..end];
+    let (n, len) = parse_prefix(text);
+    (len > 0 && len == text.len()).then_some(n)
 }
 
 /// How infinities and NaNs print: "+inf", "-inf", "+nan", "-nan" (the
@@ -251,6 +311,14 @@ mod tests {
         // Correct rounding, like strtod.
         assert_eq!(str_to_num(b"0.1"), 0.1);
         assert_eq!(str_to_num(b"1e400"), f64::INFINITY);
+        // Plain integers, including the ones the fast path handles itself.
+        assert_eq!(str_to_num(b"42"), 42.0);
+        assert_eq!(str_to_num(b"+007"), 7.0);
+        assert!(str_to_num(b"-0").is_sign_negative());
+        assert_eq!(str_to_num(b"9007199254740992"), 9007199254740992.0); // 2^53
+        // One past 2^53 is not a distinct f64; strtod rounds to even.
+        assert_eq!(str_to_num(b"9007199254740993"), 9007199254740992.0);
+        assert_eq!(str_to_num(b"18446744073709551615"), 18446744073709551616.0);
     }
 
     #[test]

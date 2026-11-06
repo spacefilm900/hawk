@@ -62,6 +62,21 @@ fn fields_and_records() {
 }
 
 #[test]
+fn arithmetic_on_fields_keeps_strnum_text() {
+    // Summing uses only the number.  Printing the field still shows the
+    // original text, and a non-numeric field contributes 0.
+    assert_eq!(
+        out(&["{ s += $2 } END { print s }"], "a 1.5 b\na 2 b\na x b\n"),
+        "3.5\n"
+    );
+    assert_eq!(out(&["{ print ($2 == 10), $2 }"], "a 10.0 b\n"), "1 10.0\n");
+    assert_eq!(
+        out(&["{ s += $1; t = t $1 } END { print s, t }"], "10\n010\n"),
+        "20 10010\n"
+    );
+}
+
+#[test]
 fn specials_round_trip_and_numeric_fs_uses_current_convfmt() {
     // A string assigned to NR stays a string until a record bumps it,
     // and the bump is arithmetic: "hello" counts as 0, so the first

@@ -116,9 +116,9 @@ pub fn substitute(re: &Regex, repl: &[u8], s: &[u8], global: bool) -> (Vec<u8>, 
     (out, count)
 }
 
-/// Split `s` at each non-empty match of `re` (split() and regex FS).
-/// An empty `s` has no fields.
-pub fn split_regex(re: &Regex, s: &[u8]) -> Vec<Vec<u8>> {
+/// Where each field of `split_regex` sits in `s`: `(start, end)` byte
+/// offsets, including empty fields.  An empty `s` has no fields.
+pub fn split_regex_spans(re: &Regex, s: &[u8]) -> Vec<(usize, usize)> {
     if s.is_empty() {
         return Vec::new();
     }
@@ -131,15 +131,26 @@ pub fn split_regex(re: &Regex, s: &[u8]) -> Vec<Vec<u8>> {
             break;
         };
         if st == en {
+            // An empty match is not a separator.  Step one character so
+            // a pattern like `x*` cannot loop forever.
             pos = charset::next(s, st, re.utf8());
             continue;
         }
-        pieces.push(s[piece_start..st].to_vec());
+        pieces.push((piece_start, st));
         piece_start = en;
         pos = en;
     }
-    pieces.push(s[piece_start..].to_vec());
+    pieces.push((piece_start, s.len()));
     pieces
+}
+
+/// Split `s` at each non-empty match of `re` (split() and regex FS).
+/// An empty `s` has no fields.
+pub fn split_regex(re: &Regex, s: &[u8]) -> Vec<Vec<u8>> {
+    split_regex_spans(re, s)
+        .into_iter()
+        .map(|(a, b)| s[a..b].to_vec())
+        .collect()
 }
 
 #[cfg(test)]
