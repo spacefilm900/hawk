@@ -127,15 +127,34 @@ impl RecordReader {
         }
     }
 
-    /// Take `buf[start..end]` as the record and move past `skip` more bytes.
+    /// Copy `buf[start..end]` into `out` and move past `skip` more bytes.
     ///
-    /// One copy, straight into the `Rc` the interpreter stores as `$0`.
-    /// Copying into a `Vec` first and then into the `Rc` copied every
-    /// record twice.
-    fn take(&mut self, end: usize, skip: usize) -> Rc<[u8]> {
-        let rec = Rc::from(&self.buf[self.start..end]);
+    /// `out` is the caller's record buffer.  The interpreter reuses one
+    /// `Vec` for every record, so this copy does not allocate once that
+    /// buffer has grown to the longest line.
+    fn take_into(&mut self, end: usize, skip: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.buf[self.start..end]);
         self.start = end + skip;
-        rec
+    }
+
+    /// The next record, appended to `out` (which is cleared first).
+    /// `Ok(false)` at the end of the input.  `regex` is needed only when
+    /// RS is longer than one byte.
+    pub fn read_record_into(
+        &mut self,
+        rs: &[u8],
+        regex: Option<RegexFinder>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        out.clear();
+        match rs.len() {
+            0 => self.read_paragraph_into(out),
+            1 => self.read_byte_into(rs[0], out),
+            _ => match regex {
+                Some(find) => self.read_regex_into(find, out),
+                None => Err(Error::Runtime("multi-character RS needs a regex".into())),
+            },
+        }
     }
 
     /// The next record without its separator, or `None` at the end.
@@ -145,21 +164,20 @@ impl RecordReader {
         rs: &[u8],
         regex: Option<RegexFinder>,
     ) -> Result<Option<Rc<[u8]>>, Error> {
-        match rs.len() {
-            0 => self.read_paragraph(),
-            1 => self.read_byte(rs[0]),
-            _ => match regex {
-                Some(find) => self.read_regex(find),
-                None => Err(Error::Runtime("multi-character RS needs a regex".into())),
-            },
+        let mut rec = Vec::new();
+        if self.read_record_into(rs, regex, &mut rec)? {
+            Ok(Some(Rc::from(rec.as_slice())))
+        } else {
+            Ok(None)
         }
     }
 
-    fn read_byte(&mut self, sep: u8) -> Result<Option<Rc<[u8]>>, Error> {
+    fn read_byte_into(&mut self, sep: u8, out: &mut Vec<u8>) -> Result<bool, Error> {
         let mut scan = self.start;
         loop {
             if let Some(k) = find_byte(&self.buf[scan..], sep) {
-                return Ok(Some(self.take(scan + k, 1)));
+                self.take_into(scan + k, 1, out);
+                return Ok(true);
             }
             let scanned = self.buf.len() - self.start;
             if !self.fill()? {
@@ -167,23 +185,24 @@ impl RecordReader {
             }
             scan = self.start + scanned;
         }
-        Ok(self.rest())
+        Ok(self.rest_into(out))
     }
 
     /// Whatever is left (the last, unterminated record), if anything.
-    fn rest(&mut self) -> Option<Rc<[u8]>> {
+    /// `true` when there was something to copy.
+    fn rest_into(&mut self, out: &mut Vec<u8>) -> bool {
         if self.start < self.buf.len() {
-            let rec = Rc::from(&self.buf[self.start..]);
+            out.extend_from_slice(&self.buf[self.start..]);
             self.buf.clear();
             self.trans.clear();
             self.start = 0;
-            Some(rec)
+            true
         } else {
-            None
+            false
         }
     }
 
-    fn read_paragraph(&mut self) -> Result<Option<Rc<[u8]>>, Error> {
+    fn read_paragraph_into(&mut self, out: &mut Vec<u8>) -> Result<bool, Error> {
         loop {
             while self.start < self.buf.len() && self.buf[self.start] == b'\n' {
                 self.start += 1;
@@ -193,12 +212,13 @@ impl RecordReader {
             }
         }
         if self.start >= self.buf.len() {
-            return Ok(None);
+            return Ok(false);
         }
         let mut scan = self.start;
         loop {
             if let Some(k) = self.buf[scan..].windows(2).position(|w| w == b"\n\n") {
-                return Ok(Some(self.take(scan + k, 2)));
+                self.take_into(scan + k, 2, out);
+                return Ok(true);
             }
             // Search again from one byte back: "\n" | "\n" may straddle reads.
             let scanned = (self.buf.len() - self.start).saturating_sub(1);
@@ -207,32 +227,35 @@ impl RecordReader {
             }
             scan = self.start + scanned;
         }
-        let mut rec = self.rest().map(|r| r.to_vec()).unwrap_or_default();
-        while rec.last() == Some(&b'\n') {
-            rec.pop();
+        if !self.rest_into(out) {
+            return Ok(false);
         }
-        Ok(Some(Rc::from(rec)))
+        while out.last() == Some(&b'\n') {
+            out.pop();
+        }
+        Ok(true)
     }
 
     /// Regex RS: as pyawk does, read everything first (a match could
     /// otherwise be cut short at a chunk boundary).  Empty matches do not
     /// separate records.
-    fn read_regex(&mut self, find: RegexFinder) -> Result<Option<Rc<[u8]>>, Error> {
+    fn read_regex_into(&mut self, find: RegexFinder, out: &mut Vec<u8>) -> Result<bool, Error> {
         while self.fill()? {}
         if self.start >= self.buf.len() {
-            return Ok(None);
+            return Ok(false);
         }
         let mut pos = self.start;
         while let Some((s, e)) = find(&self.buf, pos, &mut self.trans) {
             if e > s {
-                return Ok(Some(self.take(s, e - s)));
+                self.take_into(s, e - s, out);
+                return Ok(true);
             }
             pos = s + 1;
             if pos > self.buf.len() {
                 break;
             }
         }
-        Ok(self.rest())
+        Ok(self.rest_into(out))
     }
 }
 

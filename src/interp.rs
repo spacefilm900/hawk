@@ -198,9 +198,23 @@ pub struct Interp<'p> {
     io: Io,
 
     // ---- the current record
-    record: Rc<[u8]>,
-    /// `$0` as a value, made on first use (a strnum unless assigned a string).
+    /// The current record's bytes.  One buffer, reused for every record:
+    /// allocating a fresh string per line was most of what was left of the
+    /// record loop after the fields stopped allocating.  A value that
+    /// escapes (`x = $0`) copies out of here, so the next record can
+    /// overwrite the buffer.
+    record: Vec<u8>,
+    /// The other half of the record buffer.  The next record is read into
+    /// this, and the two are swapped only when the read succeeds, so a
+    /// failed read (end of input) does not wipe `$0`.
+    record_swap: Vec<u8>,
+    /// `$0` as a value, made on first use (a strnum unless it was assigned
+    /// a string or `sub`/`gsub` replaced something).
     record_value: Option<Value>,
+    /// `$0` must come back as a plain string, not a strnum, even when the
+    /// bytes look numeric.  Set by assigning a string to `$0` and by a
+    /// substitution that changed it.
+    record_is_string: bool,
     /// The fields, split on first use (lazy splitting).
     fields: Fields,
     /// FS when the record was read: it applies to this record even if the
@@ -343,8 +357,10 @@ impl<'p> Interp<'p> {
             ret: Value::Uninit,
             exit_code: 0,
             io: Io::new(),
-            record: empty(),
+            record: Vec::new(),
+            record_swap: Vec::new(),
             record_value: None,
+            record_is_string: false,
             fields: Fields {
                 spans: Vec::new(),
                 values: Vec::new(),
@@ -494,10 +510,10 @@ impl<'p> Interp<'p> {
     /// Read every main input record and run the pattern-action rules on
     /// it (`next` and `nextfile` end the rules early).
     fn main_loop(&mut self) -> R<()> {
-        while let Some(rec) = self.next_main_record()? {
+        while self.next_main_record()? {
             self.bump("NR");
             self.bump("FNR");
-            self.set_record(rec);
+            self.note_record();
             match self.run_rules() {
                 // `next` inside a function called from a pattern or an
                 // action: abandon this record's rules just the same.
@@ -566,13 +582,16 @@ impl<'p> Interp<'p> {
 
     // ============================================================ input
 
-    /// The next record of the main input (the operands, else stdin).
-    fn next_main_record(&mut self) -> R<Option<Rc<[u8]>>> {
+    /// Read the next main-input record into `out` (cleared by the reader).
+    /// `Ok(false)` when the input is finished.  Does not touch `$0`: the
+    /// caller decides whether this record replaces it (`getline var` must
+    /// not).
+    fn read_main(&mut self, out: &mut Vec<u8>) -> R<bool> {
         loop {
             if let Main::None = self.main
                 && !self.open_next_input()?
             {
-                return Ok(None);
+                return Ok(false);
             }
             let rs = self.var_str("RS");
             let re = self.rs_regex(&rs)?;
@@ -580,16 +599,28 @@ impl<'p> Interp<'p> {
                 re.as_deref().and_then(|r| Finder::cached(r, t, c).find(p))
             };
             let finder: Option<RegexFinder> = re.is_some().then_some(&find);
-            let rec = match &mut self.main {
-                Main::Stdin => self.io.stdin_reader().read_record(&rs, finder)?,
-                Main::File(r) => r.read_record(&rs, finder)?,
-                Main::None => None,
+            let got = match &mut self.main {
+                Main::Stdin => self.io.stdin_reader().read_record_into(&rs, finder, out)?,
+                Main::File(r) => r.read_record_into(&rs, finder, out)?,
+                Main::None => false,
             };
-            match rec {
-                Some(r) => return Ok(Some(r)),
-                None => self.main = Main::None,
+            if got {
+                return Ok(true);
             }
+            self.main = Main::None;
         }
+    }
+
+    /// Read the next record into `self.record`.  `Ok(false)` at the end.
+    fn next_main_record(&mut self) -> R<bool> {
+        let mut rec = std::mem::take(&mut self.record_swap);
+        let got = self.read_main(&mut rec)?;
+        if got {
+            self.record_swap = std::mem::replace(&mut self.record, rec);
+        } else {
+            self.record_swap = rec;
+        }
+        Ok(got)
     }
 
     /// `nextfile`: drop the rest of the current input file, so the next
@@ -663,10 +694,27 @@ impl<'p> Interp<'p> {
 
     // ===================================================== records, fields
 
-    /// Install a new `$0`; fields are split when first needed.
-    fn set_record(&mut self, text: Rc<[u8]>) {
-        self.record = text;
+    /// Install `text` as `$0`, reusing the record buffer.  Fields are
+    /// split when first needed.  `text` must not borrow `self.record`.
+    fn set_record(&mut self, text: &[u8]) {
+        if self.record.as_ptr() != text.as_ptr() {
+            let mut rec = std::mem::take(&mut self.record);
+            rec.clear();
+            rec.extend_from_slice(text);
+            self.record = rec;
+        }
         self.record_value = None;
+        self.record_is_string = false;
+        self.fields.ready = false;
+        self.fields.owned = false;
+        self.record_fs = self.var_str("FS");
+    }
+
+    /// The record buffer already holds the next record (see
+    /// `next_main_record`).  Forget the previous split and `$0` value.
+    fn note_record(&mut self) {
+        self.record_value = None;
+        self.record_is_string = false;
         self.fields.ready = false;
         self.fields.owned = false;
         self.record_fs = self.var_str("FS");
@@ -681,10 +729,15 @@ impl<'p> Interp<'p> {
         }
         let paragraph = self.var_str("RS").is_empty();
         let fs = self.record_fs.clone();
-        let rec = self.record.clone();
+        // Move the bytes out so `fill_spans` can borrow them and `self`
+        // at the same time (a regex FS compiles while it splits).  Moving
+        // a `Vec` does not copy the bytes.
+        let rec = std::mem::take(&mut self.record);
         let mut spans = std::mem::take(&mut self.fields.spans);
         spans.clear();
-        self.fill_spans(&rec, &fs, paragraph, &mut spans)?;
+        let filled = self.fill_spans(&rec, &fs, paragraph, &mut spans);
+        self.record = rec;
+        filled?;
         let n = spans.len();
         self.fields.spans = spans;
         self.fields.values.clear();
@@ -838,15 +891,23 @@ impl<'p> Interp<'p> {
     /// `$i`.  A field past NF is the empty *string* (not uninitialized),
     /// as in all three reference awks.
     ///
-    /// `$0` shares the record's bytes instead of copying them.  A field
-    /// that so far was only used as a number still has no `Value`; this
-    /// builds one from the span (a strnum when the whole field is numeric).
+    /// `$0` is copied out of the record buffer the first time it is needed
+    /// as a value, so the next record can reuse the buffer.  A field that
+    /// so far was only used as a number still has no `Value`; this builds
+    /// one from the span (a strnum when the whole field is numeric).
     fn get_field(&mut self, i: usize) -> R<Value> {
         if i == 0 {
             if self.record_value.is_none() {
-                self.record_value = Some(match looks_numeric(&self.record) {
-                    Some(n) => Value::StrNum(self.record.clone(), n),
-                    None => Value::Str(self.record.clone()),
+                // A copy: the record buffer is overwritten by the next
+                // line, and this value must keep these bytes.
+                let rc: Rc<[u8]> = Rc::from(&self.record[..]);
+                self.record_value = Some(if self.record_is_string {
+                    Value::Str(rc)
+                } else {
+                    match looks_numeric(&self.record) {
+                        Some(n) => Value::StrNum(rc, n),
+                        None => Value::Str(rc),
+                    }
                 });
             }
             return Ok(self.record_value.clone().unwrap());
@@ -897,8 +958,10 @@ impl<'p> Interp<'p> {
     fn set_field(&mut self, i: usize, v: Value) -> R<()> {
         if i == 0 {
             let text = self.to_str(&v);
-            self.set_record(text);
-            if v.is_str() {
+            let is_str = v.is_str();
+            self.set_record(&text);
+            if is_str {
+                self.record_is_string = true;
                 self.record_value = Some(v);
             }
             return Ok(());
@@ -930,9 +993,10 @@ impl<'p> Interp<'p> {
             // the list) stored a value in every slot before this runs.
             rec.extend_from_slice(&f.as_ref().unwrap().to_str(&convfmt));
         }
-        let rec: Rc<[u8]> = Rc::from(rec);
-        self.record = rec.clone();
-        self.record_value = Some(Value::Str(rec));
+        let rc: Rc<[u8]> = Rc::from(&rec[..]);
+        self.record = rec;
+        self.record_is_string = true;
+        self.record_value = Some(Value::Str(rc));
         self.fields.owned = true;
         self.fields.ready = true;
     }
@@ -1282,10 +1346,18 @@ impl<'p> Interp<'p> {
     /// Append field `i`'s text to `key_buf`.  The text is the field as it
     /// would print: the original bytes, or CONVFMT if the field was
     /// assigned a number.
+    fn append_record_slice(&mut self, start: usize, end: usize) {
+        // `key_buf` and `record` are both fields, so one of them steps
+        // aside for the copy.
+        let mut key = std::mem::take(&mut self.key_buf);
+        key.extend_from_slice(&self.record[start..end]);
+        self.key_buf = key;
+    }
+
     fn append_field_key(&mut self, i: usize) -> R<()> {
         if i == 0 {
-            let rec = self.record.clone();
-            self.key_buf.extend_from_slice(&rec);
+            let n = self.record.len();
+            self.append_record_slice(0, n);
             return Ok(());
         }
         self.ensure_fields()?;
@@ -1299,8 +1371,7 @@ impl<'p> Interp<'p> {
             return Ok(());
         }
         let (a, b) = self.fields.spans[idx];
-        let rec = self.record.clone();
-        self.key_buf.extend_from_slice(&rec[a..b]);
+        self.append_record_slice(a, b);
         Ok(())
     }
 
@@ -1948,14 +2019,24 @@ impl<'p> Interp<'p> {
                 if let Some(t) = target {
                     place = Some(self.resolve_target(t)?);
                 }
-                match self.next_main_record()? {
-                    None => return Ok(Value::Num(0.0)),
-                    Some(r) => {
-                        self.bump("NR");
-                        self.bump("FNR");
-                        r
+                if place.is_none() {
+                    if !self.next_main_record()? {
+                        return Ok(Value::Num(0.0));
                     }
+                    self.bump("NR");
+                    self.bump("FNR");
+                    self.note_record();
+                    return Ok(Value::Num(1.0));
                 }
+                // Into a variable: the current $0 stays as it is.
+                let mut buf = Vec::new();
+                if !self.read_main(&mut buf)? {
+                    return Ok(Value::Num(0.0));
+                }
+                self.bump("NR");
+                self.bump("FNR");
+                self.set_place(&place.unwrap(), Value::strnum(&buf))?;
+                return Ok(Value::Num(1.0));
             }
             GetlineKind::File | GetlineKind::Cmd => {
                 let src = match source {
@@ -1989,7 +2070,7 @@ impl<'p> Interp<'p> {
             }
         };
         match place {
-            None => self.set_record(rec),
+            None => self.set_record(&rec),
             Some(p) => self.set_place(&p, Value::strnum(&rec))?,
         }
         Ok(Value::Num(1.0))
@@ -2049,19 +2130,19 @@ impl<'p> Interp<'p> {
             return None;
         }
         // Copy the pattern out of `re` before borrowing the record.
+        // The record is our own buffer, not shared with a saved `$0`
+        // (that was copied out when the value was built), so it can
+        // always be overwritten.
         let lit = lit.to_vec();
-        let n = {
-            let buf = Rc::get_mut(&mut self.record)?;
-            replace_literal(buf, &lit, repl, global)
-        };
+        let n = replace_literal(&mut self.record, &lit, repl, global);
         if n > 0 {
             // The bytes changed, so a previous split is wrong, and `$0`
             // is now a plain string (not a strnum), same as assigning
             // the result of the general substitution.
             self.fields.ready = false;
             self.fields.owned = false;
-            let text = self.record.clone();
-            self.record_value = Some(Value::Str(text));
+            self.record_is_string = true;
+            self.record_value = None;
         }
         Some(n)
     }
@@ -2075,7 +2156,12 @@ impl<'p> Interp<'p> {
             Length => {
                 Self::arity(b, args, 0, 1)?;
                 match args.first() {
-                    None => num(self.length(&self.record.clone())),
+                    None => num(self.length(&self.record)),
+                    // `$0` is the record buffer; counting it does not
+                    // need a copy of the bytes.
+                    Some(Expr::Field(ix)) if matches!(ix.as_ref(), Expr::Num(n) if *n == 0.0) => {
+                        num(self.length(&self.record))
+                    }
                     Some(Expr::Var(name)) => match self.array_if_array(name) {
                         Some(Some(arr)) => num(arr.borrow().len() as f64),
                         Some(None) => num(0.0), // untyped: stays untyped
