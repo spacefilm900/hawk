@@ -361,3 +361,72 @@ fn dash_is_a_file_name_for_output() {
     assert_eq!(std::fs::read_to_string(dir.join("-")).unwrap(), "dash\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ------------------------------------------- FILENAME on implicit stdin
+// POSIX.1-2024 awk, "ARGV": when no file operand is left and none has been
+// processed, "awk shall set FILENAME to '-' and process standard input as
+// if it was given as a file operand".  The FILENAME entry agrees: "or '-'
+// if the file is standard input".  mawk and gawk do this; hawk v1.2 left
+// FILENAME empty.  (awk-posix-challenge cases AWK-391, 392 and 399.)
+
+/// Run `hawk prog operands...` with `input` on stdin; return stdout.
+fn run_operands(prog: &str, operands: &[&str], input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hawk"))
+        .env("LC_ALL", "C")
+        .arg(prog)
+        .args(operands)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("hawk runs");
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(input.as_bytes());
+    drop(stdin); // closing stdin lets hawk see end of input
+    let o = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn filename_is_dash_for_stdin_without_operands() {
+    let out = run_operands(r#"{ print "[" FILENAME "]:" $0 }"#, &[], "alpha\nbeta\n");
+    assert_eq!(out, "[-]:alpha\n[-]:beta\n");
+}
+
+#[test]
+fn filename_is_dash_for_stdin_with_only_assignment_operands() {
+    let out = run_operands(r#"{ print "[" FILENAME "]:" v ":" $0 }"#, &["v=7"], "x\n");
+    assert_eq!(out, "[-]:7:x\n");
+}
+
+#[test]
+fn filename_is_dash_when_argv_turned_into_an_assignment() {
+    // The operand is replaced in BEGIN, so the named file is never opened.
+    let prog = r#"BEGIN { ARGV[1] = "v=7" } { print "[" FILENAME "]:" v ":" $0 }"#;
+    let out = run_operands(prog, &["not-opened"], "hello\n");
+    assert_eq!(out, "[-]:7:hello\n");
+}
+
+#[test]
+fn filename_dash_is_kept_in_end_and_set_by_getline_in_begin() {
+    // END sees the last file processed, here standard input, even if empty.
+    assert_eq!(
+        run_operands(r#"END { print "[" FILENAME "]", NR }"#, &[], ""),
+        "[-] 0\n"
+    );
+    // A plain getline in BEGIN opens the main input, so FILENAME is set then.
+    let out = run_operands(
+        r#"BEGIN { getline; print "[" FILENAME "]" $0 }"#,
+        &[],
+        "x\n",
+    );
+    assert_eq!(out, "[-]x\n");
+}
+
+#[test]
+fn filename_is_still_unset_in_begin() {
+    // "Inside a BEGIN action FILENAME shall be unset."
+    assert_eq!(
+        run(r#"BEGIN { print "[" FILENAME "]" }"#, "x\n").out,
+        "[]\n"
+    );
+}
