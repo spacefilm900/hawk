@@ -38,7 +38,7 @@ gawk, `LC_ALL=C`:
 | printf | 0.21 | 0.22 | 0.34 |
 
 UTF-8 mode (`--locale C.UTF-8`) is within a hundredth of those hawk
-numbers. At v1.1, before that work, the same runs were 0.26, 0.13, 0.25,
+numbers (hawk v1.2). At v1.1, before that work, the same runs were 0.26, 0.13, 0.25,
 0.29 and 0.47. DESIGN.md, "Performance", says what changed and what a
 compiler would still buy.
 

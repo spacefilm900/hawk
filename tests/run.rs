@@ -429,10 +429,10 @@ fn runs_when_the_big_stack_cannot_be_reserved() {
 }
 
 #[test]
-fn version_is_1_1() {
-    // `--version` prints the version from Cargo.toml; v1.1 adds the pyawk
-    // v1.1 features.
-    assert_eq!(out(&["--version"], ""), "hawk 1.1.0\n");
+fn version_is_1_2() {
+    // `--version` prints the version from Cargo.toml; v1.1 added the pyawk
+    // v1.1 features, and v1.2 is the performance round.
+    assert_eq!(out(&["--version"], ""), "hawk 1.2.0\n");
 }
 
 #[test]
