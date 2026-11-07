@@ -117,6 +117,14 @@ impl Regex {
         self.utf8
     }
 
+    /// True when a match has to be run on a transcoded copy of the text
+    /// (a pattern that can match an invalid byte; see `Transcoded`).
+    /// The bytes of [`Self::literal_bytes`] are then the escaped form, not
+    /// the bytes in the original record.
+    pub fn is_raw(&self) -> bool {
+        self.raw
+    }
+
     /// The bytes of a pattern that is only a short fixed string, if it is
     /// one (`a`, `foo`).  Operators, classes and anything longer than 32
     /// bytes are `None`.

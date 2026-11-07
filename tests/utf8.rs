@@ -31,6 +31,21 @@ fn u(prog: &str, input: &str) -> String {
 }
 
 #[test]
+fn gsub_of_a_raw_byte_escape_replaces_that_byte() {
+    // \351 in UTF-8 mode is the invalid byte E9, not the three bytes the
+    // pattern is compiled to. The replacement is the same length as those
+    // three bytes, which must not make the search look for them literally.
+    assert_eq!(
+        run_in(
+            "C.UTF-8",
+            r#"{ print gsub(/\351/, "abc"), $0 }"#,
+            b"a\xe9b\n"
+        ),
+        b"1 aabcb\n"
+    );
+}
+
+#[test]
 fn the_locale_variables_choose_the_mode() {
     let prog = "{ print length($0) }";
     assert_eq!(run_in("C.UTF-8", prog, "é\n".as_bytes()), b"1\n");

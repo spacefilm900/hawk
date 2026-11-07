@@ -97,6 +97,51 @@ fn array_increment_keeps_field_text_and_insertion_order() {
 }
 
 #[test]
+fn command_line_assignments_of_the_same_length_stay_distinct() {
+    // Two -v names of the same length are built in a temporary that the
+    // allocator may reuse. Each assignment has to stick to its own name.
+    assert_eq!(
+        out(&["-v", "aa=1", "-v", "bb=2", "BEGIN { print aa, bb }"], ""),
+        "1 2\n"
+    );
+}
+
+#[test]
+fn nested_array_increment_keeps_the_outer_key() {
+    // f's own c[$1]++ must not become part of the key of a[f($2)]++.
+    assert_eq!(
+        out(
+            &[
+                "function f(x) { c[$1]++; return x } { a[f($2)]++ } END { for (k in a) print k, a[k]; for (k in c) print k, c[k] }"
+            ],
+            "foo bar\n"
+        ),
+        "bar 1\nfoo 1\n"
+    );
+}
+
+#[test]
+fn printf_evaluates_arguments_the_format_does_not_use() {
+    assert_eq!(
+        out(
+            &[
+                "BEGIN { printf \"x\", i++; print \"i=\" i; s = sprintf(\"y\", i++); print \"s=\" s, \"i=\" i }"
+            ],
+            ""
+        ),
+        "xi=1\ns=y i=2\n"
+    );
+}
+
+#[test]
+fn gsub_in_place_uses_the_current_fs() {
+    assert_eq!(
+        out(&["{ FS=\":\"; gsub(/a/, \"b\"); print $1 }"], "a:x\n"),
+        "b\n"
+    );
+}
+
+#[test]
 fn a_function_sees_the_latest_global() {
     // The action and END name `s` separately, and a function reads the
     // map rather than the expression that last wrote it.

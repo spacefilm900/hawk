@@ -1148,8 +1148,6 @@ impl<'p> Interp<'p> {
         frame.params.iter().position(|p| p == name)
     }
 
-    /// Read a global scalar.  The first read of an unset name makes it a
-    /// scalar (it can no longer become an array).
     /// Write the cached global back into the map.  Cheap when the cache
     /// is empty; otherwise one map update.  Called when a different name,
     /// or the same name from a different expression, is about to be used,
@@ -1164,11 +1162,24 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// True when `name` is the scalar already in the cache.
+    ///
+    /// The pointer and the length are not enough.  `-v aa=1 -v bb=2`
+    /// builds each name in a temporary, and the allocator can hand the
+    /// second name the same address as the first.  The letters have to
+    /// match too, or `bb` would be written into `aa`.
+    fn scalar_is_cached(&self, name: &str) -> bool {
+        self.sc_on
+            && self.sc_ptr == name.as_ptr()
+            && self.sc_len == name.len()
+            && self.sc_name == name
+    }
+
     /// Point the cache at `name`, which is an ordinary scalar.  No work
     /// when this expression's name is already the one cached.
     fn touch_scalar(&mut self, name: &str) {
         let p = name.as_ptr();
-        if self.sc_on && self.sc_ptr == p && self.sc_len == name.len() {
+        if self.scalar_is_cached(name) {
             return;
         }
         self.store_scalar();
@@ -1203,7 +1214,7 @@ impl<'p> Interp<'p> {
             return Ok(v.clone());
         }
         self.touch_scalar(name);
-        if self.sc_on && self.sc_ptr == name.as_ptr() && self.sc_len == name.len() {
+        if self.scalar_is_cached(name) {
             return Ok(self.sc_val.clone());
         }
         match self.globals.get(name) {
@@ -1226,7 +1237,7 @@ impl<'p> Interp<'p> {
             return Ok(());
         }
         self.touch_scalar(name);
-        if self.sc_on && self.sc_ptr == name.as_ptr() && self.sc_len == name.len() {
+        if self.scalar_is_cached(name) {
             self.sc_val = v;
             return Ok(());
         }
@@ -1326,18 +1337,30 @@ impl<'p> Interp<'p> {
 
     /// Append one subscript's key text to `key_buf`.  A field is copied
     /// off the record; anything else is evaluated and stringified.
+    /// Evaluate `e` without losing `key_buf`.
+    ///
+    /// The subscript of `a[f($2)]++` is evaluated while that key is being
+    /// built.  `f` may itself do `c[$1]++`, which uses the same buffer.
+    /// The outer key is set aside for the call and put back afterwards.
+    fn eval_keeping_key(&mut self, e: &'p Expr) -> R<Value> {
+        let saved = std::mem::take(&mut self.key_buf);
+        let v = self.eval(e);
+        self.key_buf = saved;
+        v
+    }
+
     fn append_key_piece(&mut self, e: &'p Expr) -> R<()> {
         if let Expr::Field(index) = e {
             let i = match index.as_ref() {
                 Expr::Num(n) => self.field_index(*n)?,
                 _ => {
-                    let v = self.eval(index)?;
+                    let v = self.eval_keeping_key(index)?;
                     self.field_number(&v)?
                 }
             };
             return self.append_field_key(i);
         }
-        let v = self.eval(e)?;
+        let v = self.eval_keeping_key(e)?;
         let s = self.to_str(&v);
         self.key_buf.extend_from_slice(&s);
         Ok(())
@@ -1709,7 +1732,7 @@ impl<'p> Interp<'p> {
             None => return Ok(()),
         };
         let mut i = 1; // args[0] is the format
-        let result = format_compiled(out, &compiled, &convfmt, utf8, |kind| {
+        let result: R<()> = format_compiled(out, &compiled, &convfmt, utf8, |kind| {
             let Some(e) = args.get(i) else {
                 i += 1;
                 // A missing argument is not an unset variable: `%c` prints
@@ -1728,7 +1751,13 @@ impl<'p> Interp<'p> {
             self.fmt_ptr = ptr;
             self.fmt_len = len;
         }
-        result
+        result?;
+        // `printf "x", i++` has nothing for `i++` to fill, but the
+        // argument is still evaluated.  The same for sprintf.
+        for e in args.iter().skip(i) {
+            self.eval(e)?;
+        }
+        Ok(())
     }
 
     /// Evaluate `args` (the format first) and format them as printf does.
@@ -2120,11 +2149,17 @@ impl<'p> Interp<'p> {
     /// `Some(count)` means the replacement was done (including a count of
     /// zero: the text did not change).  `None` means the caller should
     /// use the general substitution: the pattern is not a fixed string,
-    /// the replacement is not the same number of plain bytes (`&` and
-    /// backslashes are special), or some other value still shares the
-    /// record.  Sharing matters: `x = $0` must keep the old text when
-    /// `gsub` then changes `$0`.
+    /// it is a raw regex (see `is_raw`), or the replacement is not the
+    /// same number of plain bytes (`&` and backslashes are special).
     fn replace_record_inplace(&mut self, re: &Regex, repl: &[u8], global: bool) -> Option<usize> {
+        // A raw regex (an invalid byte written as `\351` in UTF-8 mode)
+        // is compiled to the bytes of its escaped form.  Those bytes are
+        // not what the match looks for in the record; the general path
+        // transcodes the record first.  Searching for them here would
+        // miss the byte.
+        if re.is_raw() {
+            return None;
+        }
         let lit = re.literal_bytes()?;
         if lit.len() != repl.len() || repl.contains(&b'&') || repl.contains(&b'\\') {
             return None;
@@ -2143,6 +2178,11 @@ impl<'p> Interp<'p> {
             self.fields.owned = false;
             self.record_is_string = true;
             self.record_value = None;
+            // Assigning `$0` (what the general path does) splits the new
+            // text with the FS that is current now, not the one from when
+            // the record was read.  `{ FS=":"; gsub(/a/,"b"); print $1 }`
+            // on `a:x` is `b`.
+            self.record_fs = self.var_str("FS");
         }
         Some(n)
     }
