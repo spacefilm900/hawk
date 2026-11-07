@@ -684,8 +684,13 @@ impl<'p> Interp<'p> {
             return Ok(true);
         }
         if !self.opened_any {
+            // No file operand was processed (there were none, or only
+            // var=value assignments), so read standard input.  POSIX.1-2024
+            // says awk "shall set FILENAME to '-'" in this case, as if "-"
+            // had been given; mawk and gawk do the same.
             self.opened_any = true;
             self.main = Main::Stdin;
+            self.set_global("FILENAME", Value::str(b"-"))?;
             self.set_global("FNR", Value::Num(0.0))?;
             return Ok(true);
         }
