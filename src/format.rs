@@ -454,27 +454,63 @@ fn format_float(out: &mut Vec<u8>, spec: &Spec, x: f64) {
     pad_number(out, prefix, body.as_bytes(), spec, true);
 }
 
-/// `printf`/`sprintf`: format `args` with `fmt`.  `convfmt` converts
-/// numbers given to `%s`/`%c`.  In UTF-8 mode (`utf8`) `%c` of a number
-/// writes that code point, `%c` of a string its first character, and the
-/// widths and precisions of `%s` and `%c` count characters.
-pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut next = 0;
-    // A closure that hands out the next argument (None when they ran
-    // out).  `move` is not needed: it borrows `args` and `next`.
-    let mut take = || {
-        let v = args.get(next).cloned();
-        next += 1;
-        v
-    };
-    for piece in parse(fmt) {
+/// What the next `printf` argument will be used for.  A number is enough
+/// for `%d` and `%f` (the text of a field is not needed); `%s` and `%c`
+/// need the real value.
+#[derive(Clone, Copy)]
+pub enum FmtArg {
+    /// The numeric value.
+    Number,
+    /// The value as it would be printed or indexed (`%s`).
+    Value,
+    /// `%c`: an unset variable, a number and a string are three cases.
+    Char,
+}
+
+/// One piece of a format, owning its text so it can be reused for every
+/// record.  Parsing `"%5.2f %d %s\n"` on every line was a visible part of
+/// `printf` in the profiles.
+#[derive(Clone)]
+enum OwnedPiece {
+    Text(Vec<u8>),
+    Conv(Spec, Vec<u8>),
+}
+
+/// A format parsed once.
+#[derive(Clone, Default)]
+pub struct CompiledFormat {
+    pieces: Vec<OwnedPiece>,
+}
+
+/// Parse `fmt` into pieces that do not borrow it.
+pub fn compile_format(fmt: &[u8]) -> CompiledFormat {
+    CompiledFormat {
+        pieces: parse(fmt)
+            .into_iter()
+            .map(|p| match p {
+                Piece::Text(t) => OwnedPiece::Text(t.to_vec()),
+                Piece::Conv(spec, raw) => OwnedPiece::Conv(spec, raw.to_vec()),
+            })
+            .collect(),
+    }
+}
+
+/// Append the formatted text of `pieces` to `out`.  `take` supplies the
+/// next argument; it is told what the argument will be used as.
+pub fn format_compiled<E>(
+    out: &mut Vec<u8>,
+    compiled: &CompiledFormat,
+    convfmt: &[u8],
+    utf8: bool,
+    mut take: impl FnMut(FmtArg) -> Result<Value, E>,
+) -> Result<(), E> {
+    for piece in &compiled.pieces {
         let (mut spec, raw) = match piece {
-            Piece::Text(t) => {
+            OwnedPiece::Text(t) => {
                 out.extend_from_slice(t);
                 continue;
             }
-            Piece::Conv(spec, raw) => (spec, raw),
+            OwnedPiece::Conv(spec, raw) => (spec.clone(), raw.as_slice()),
         };
         if spec.conv == b'%' {
             out.push(b'%');
@@ -486,35 +522,36 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> 
             continue;
         }
         if spec.width_star {
-            let w = to_c_int(take().unwrap_or(Value::Uninit).to_num());
+            let w = to_c_int(take(FmtArg::Number)?.to_num());
             if w < 0 {
                 spec.minus = true;
             }
             spec.width = Some(w.unsigned_abs().min(MAX_WIDTH as u128) as usize);
         }
         if spec.prec_star {
-            let p = to_c_int(take().unwrap_or(Value::Uninit).to_num());
+            let p = to_c_int(take(FmtArg::Number)?.to_num());
             spec.prec = (p >= 0).then(|| p.min(MAX_WIDTH as i128) as usize);
         }
         if !known {
             out.extend_from_slice(raw);
             continue;
         }
-        let arg = take();
-        // `%c` is the one conversion where a missing argument differs from
-        // an unset variable (see below); for the others both are 0 or "".
         if spec.conv == b'c' {
+            let arg = take(FmtArg::Char)?;
             let mut ch = Vec::new();
             match arg {
-                None => {}
-                // An unset variable is the number 0: a NUL byte.
-                Some(Value::Uninit) => ch.push(0),
+                // An unset variable is the number 0: a NUL byte.  A missing
+                // argument is also passed as uninit by the caller, which
+                // prints nothing; the two are distinguished by the caller
+                // only when it still has the `Option`.  `format_printf`
+                // preserves that by passing a sentinel (see below).
+                Value::Uninit => ch.push(0),
                 // A numeric string (such as a field "65") counts as a
-                // number here, as POSIX says: `|` matches either variant.
-                Some(Value::Num(n) | Value::StrNum(_, n)) => {
+                // number here, as POSIX says.
+                Value::Num(n) | Value::StrNum(_, n) => {
                     charset::char_for_code(n.trunc(), utf8, &mut ch)
                 }
-                Some(other) => {
+                other => {
                     let s = other.to_str(convfmt);
                     if !s.is_empty() {
                         let n = if utf8 { charset::char_len(&s, 0) } else { 1 };
@@ -523,12 +560,17 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> 
                 }
             };
             let size = if ch.is_empty() { 0 } else { 1 };
-            pad_chars(&mut out, &ch, size, &spec);
+            pad_chars(out, &ch, size, &spec);
             continue;
         }
-        let v = arg.unwrap_or(Value::Uninit);
+        let numeric = !matches!(spec.conv, b's');
+        let v = take(if numeric {
+            FmtArg::Number
+        } else {
+            FmtArg::Value
+        })?;
         match spec.conv {
-            b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => format_int(&mut out, &spec, v.to_num()),
+            b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => format_int(out, &spec, v.to_num()),
             b's' => {
                 let s = v.to_str(convfmt);
                 if utf8 && !s.is_ascii() {
@@ -536,18 +578,42 @@ pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> 
                         Some(p) => &s[..charset::byte_offset(&s, p)],
                         None => &s[..],
                     };
-                    pad_chars(&mut out, s, charset::count(s), &spec);
+                    pad_chars(out, s, charset::count(s), &spec);
                 } else {
                     let s = match spec.prec {
                         Some(p) if p < s.len() => &s[..p],
                         _ => &s[..],
                     };
-                    pad(&mut out, s, &spec);
+                    pad(out, s, &spec);
                 }
             }
-            _ => format_float(&mut out, &spec, v.to_num()),
+            _ => format_float(out, &spec, v.to_num()),
         }
     }
+    Ok(())
+}
+
+/// `printf`/`sprintf`: format `args` with `fmt`.  `convfmt` converts
+/// numbers given to `%s`/`%c`.  In UTF-8 mode (`utf8`) `%c` of a number
+/// writes that code point, `%c` of a string its first character, and the
+/// widths and precisions of `%s` and `%c` count characters.
+pub fn format_printf(fmt: &[u8], args: &[Value], convfmt: &[u8], utf8: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let compiled = compile_format(fmt);
+    let mut next = 0;
+    // A missing `%c` argument prints nothing, while an unset variable
+    // prints a NUL.  The compiled formatter treats `Uninit` as the NUL, so
+    // a missing argument is handed over as an empty string instead: `%c`
+    // of "" prints nothing, and every other conversion treats "" as 0.
+    format_compiled(&mut out, &compiled, convfmt, utf8, |_| {
+        let v = match args.get(next) {
+            Some(v) => v.clone(),
+            None => Value::str(b""),
+        };
+        next += 1;
+        Ok::<_, ()>(v)
+    })
+    .unwrap();
     out
 }
 

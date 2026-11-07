@@ -62,6 +62,148 @@ fn fields_and_records() {
 }
 
 #[test]
+fn gsub_of_dollar0_does_not_change_a_saved_copy() {
+    // The result of gsub is a string, so "1" does not compare as a
+    // number.  A copy taken before gsub keeps the original bytes.
+    assert_eq!(
+        out(
+            &["{ gsub(/a/, \"1.0\"); print ($0 == 1), ($0 == \"1.0\") }"],
+            "a\n"
+        ),
+        "0 1\n"
+    );
+    assert_eq!(
+        out(&["{ x = $0; gsub(/a/, \"A\"); print x, $0 }"], "ab a\n"),
+        "ab a Ab A\n"
+    );
+    assert_eq!(
+        out(&["{ print sub(/a/, \"A\"), $0 }"], "ab a\n"),
+        "1 Ab a\n"
+    );
+}
+
+#[test]
+fn array_increment_keeps_field_text_and_insertion_order() {
+    // The key is the field's text ("010", not 10) and ++ yields the old
+    // number. for-in walks in insertion order.
+    assert_eq!(
+        out(
+            &["{ c[$1]++ } END { for (k in c) print k, c[k] }"],
+            "010\nb\n010\n"
+        ),
+        "010 2\nb 1\n"
+    );
+    assert_eq!(out(&["{ print ++c[$1], c[$1] }"], "a\n"), "1 1\n");
+}
+
+#[test]
+fn command_line_assignments_of_the_same_length_stay_distinct() {
+    // Two -v names of the same length are built in a temporary that the
+    // allocator may reuse. Each assignment has to stick to its own name.
+    assert_eq!(
+        out(&["-v", "aa=1", "-v", "bb=2", "BEGIN { print aa, bb }"], ""),
+        "1 2\n"
+    );
+}
+
+#[test]
+fn nested_array_increment_keeps_the_outer_key() {
+    // f's own c[$1]++ must not become part of the key of a[f($2)]++.
+    assert_eq!(
+        out(
+            &[
+                "function f(x) { c[$1]++; return x } { a[f($2)]++ } END { for (k in a) print k, a[k]; for (k in c) print k, c[k] }"
+            ],
+            "foo bar\n"
+        ),
+        "bar 1\nfoo 1\n"
+    );
+}
+
+#[test]
+fn printf_evaluates_arguments_the_format_does_not_use() {
+    assert_eq!(
+        out(
+            &[
+                "BEGIN { printf \"x\", i++; print \"i=\" i; s = sprintf(\"y\", i++); print \"s=\" s, \"i=\" i }"
+            ],
+            ""
+        ),
+        "xi=1\ns=y i=2\n"
+    );
+}
+
+#[test]
+fn gsub_in_place_uses_the_current_fs() {
+    assert_eq!(
+        out(&["{ FS=\":\"; gsub(/a/, \"b\"); print $1 }"], "a:x\n"),
+        "b\n"
+    );
+}
+
+#[test]
+fn a_function_sees_the_latest_global() {
+    // The action and END name `s` separately, and a function reads the
+    // map rather than the expression that last wrote it.
+    assert_eq!(
+        out(
+            &["function f(x) { return x + 1 } { s += $1 } END { print f(s), s }"],
+            "3\n4\n"
+        ),
+        "8 7\n"
+    );
+}
+
+#[test]
+fn arithmetic_on_fields_keeps_strnum_text() {
+    // Summing uses only the number.  Printing the field still shows the
+    // original text, and a non-numeric field contributes 0.
+    assert_eq!(
+        out(&["{ s += $2 } END { print s }"], "a 1.5 b\na 2 b\na x b\n"),
+        "3.5\n"
+    );
+    assert_eq!(out(&["{ print ($2 == 10), $2 }"], "a 10.0 b\n"), "1 10.0\n");
+    assert_eq!(
+        out(&["{ s += $1; t = t $1 } END { print s, t }"], "10\n010\n"),
+        "20 10010\n"
+    );
+}
+
+#[test]
+fn specials_round_trip_and_numeric_fs_uses_current_convfmt() {
+    // A string assigned to NR stays a string until a record bumps it,
+    // and the bump is arithmetic: "hello" counts as 0, so the first
+    // record makes NR 1.
+    assert_eq!(
+        out(
+            &["BEGIN { NR = \"hello\"; FS = \":\"; OFS = \",\" } END { print NR, FS }"],
+            ""
+        ),
+        "hello,:\n"
+    );
+    assert_eq!(
+        out(&["BEGIN { NR = \"hello\" } { print NR }"], "a\n"),
+        "1\n"
+    );
+    // FS assigned as a number is stringified with the CONVFMT in force
+    // when the record is split, including a CONVFMT set afterwards.
+    assert_eq!(
+        out(
+            &["BEGIN { FS = 1/3; CONVFMT = \"%.2f\" } { print NF, $1, $2 }"],
+            "a0.33b\n"
+        ),
+        "2 a b\n"
+    );
+    assert_eq!(
+        out(
+            &["BEGIN { CONVFMT = \"%.2f\"; FS = 1/3 } { print NF, $1, $2 }"],
+            "a0.33b\n"
+        ),
+        "2 a b\n"
+    );
+}
+
+#[test]
 fn assignments_from_the_command_line() {
     assert_eq!(
         out(&["-v", "x=10", "BEGIN { print x + 1, (x < 9) }"], ""),

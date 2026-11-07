@@ -115,12 +115,15 @@ reference, and a variable can turn out to be an array only when a function
 uses it as one. So an array slot is `Rc<RefCell<Array>>`: shared
 ownership (`Rc`) of a value that may be changed through any of its owners
 (`RefCell` checks the borrowing rules at run time instead of compile time).
-Array keys come from the input, so the key index uses the standard
-library's randomly seeded hasher: input crafted so that every key lands in
-the same hash bucket (which made inserts quadratic with the unseeded FxHash
-used before) cannot be prepared in advance. FxHash is kept for global
-variable names (chosen by the program text) and the regex cache (at most
-512 entries, so collisions there cannot cost much).
+Array keys come from the input, so each array's key index uses FxHash with
+a random per-array seed: input crafted so that every key lands in the same
+hash bucket (which made inserts quadratic with the unseeded FxHash used
+before) cannot be prepared in advance. FxHash is not cryptographic: a
+caller who can time lookups against a live process could still search for
+a collision. It is several times faster than SipHash, and the seed
+closes the attack the unseeded hash actually had. Global variable names
+(chosen by the program text) and the regex cache (at most 512 entries)
+keep the fixed-seed FxHash.
 
 ## Execution model (phase 3)
 
@@ -130,10 +133,11 @@ walking a tree in Python is slow. hawk instead walks the tree directly
 value, each a `match` over the node kinds. In Rust a tree walk is already
 fast, it is far simpler to read and to check against pyawk's semantics,
 and it keeps the borrow checker out of the way (closures that capture a
-mutable interpreter are awkward in Rust). Correctness comes first;
-performance is measured in phase 8, and the hot spots (global variable
-lookup by name, string constants allocated on each evaluation) can then be
-resolved to slots or cached at load time without changing the interface.
+mutable interpreter are awkward in Rust). Correctness comes first.
+Performance was measured after v1.1 (see "Performance" below). The hot
+spots that section names (variable lookup, a fresh string per field) were
+removed without changing what programs print. Compiling the tree to
+closures or bytecode was not done; that section says what it would take.
 
 * **Variables.** Globals live in a hash map from name to
   `Var::Scalar(Value)` or `Var::Array(ArrayRef)`; a missing name is still
@@ -603,6 +607,139 @@ Decisions:
   U+DC80..DCFF, so the two can order an invalid byte differently against
   a non-ASCII character: `"\200" < "é"` is 1 in hawk, mawk and gawk
   (also with `--posix`), 0 in pyawk. **Flagged decision.**
-* **Speed.** On the benchmark UTF-8 mode is within noise of C mode; on
-  non-ASCII text `gsub(/./, ...)` and class matches cost the same as in
-  C mode and `length` about 20% more (it counts characters).
+* **Speed.** On the benchmark UTF-8 mode is within noise of C mode
+  (the table in "Performance" below); on non-ASCII text `gsub(/./, ...)`
+  and class matches cost the same as in C mode and `length` about 20%
+  more (it counts characters).
+
+## Performance
+
+The interpreter still walks the syntax tree. What changed is everything
+the walk was doing besides the arithmetic: hashing a name, allocating a
+string, parsing that string back into a number, and throwing the string
+away. Callgrind (instruction counts, not a sampling profiler) on an
+8,000-line cut of `tools/bench.py`'s input said where. On the original
+v1.1 binary, a field sum spent about 45% of its instructions inside
+`get_field` and the allocator was the single largest callee in every
+program; `bump("NR")` allocated a fresh map key on every record; `printf`
+parsed its format string on every record.
+
+Each change below kept the output identical to the previous binary (the
+benchmark refuses a time when the awks disagree, and the corpus is the
+real check). Times are the best of 3 on this machine, 500,000 lines,
+`LC_ALL=C`, seconds. The "before" column is hawk at the v1.1 tag; mawk
+and gawk are on the same box. Absolute times will differ elsewhere; the
+ratios are the point.
+
+| program | hawk before | hawk after | mawk | gawk |
+|---|---:|---:|---:|---:|
+| field sum | 0.26 | 0.07 | 0.05 | 0.07 |
+| regex filter | 0.13 | 0.06 | 0.05 | 0.06 |
+| gsub | 0.25 | 0.09 | 0.05 | 0.20 |
+| regex FS + arrays | 0.29 | 0.08 | 0.08 | 0.12 |
+| printf | 0.47 | 0.21 | 0.22 | 0.34 |
+
+UTF-8 mode (`tools/bench.py --locale C.UTF-8`, same ASCII input) is the
+same story. hawk after / mawk / gawk:
+
+| program | hawk | mawk | gawk |
+|---|---:|---:|---:|
+| field sum | 0.07 | 0.05 | 0.07 |
+| regex filter | 0.06 | 0.05 | 0.10 |
+| gsub | 0.10 | 0.05 | 0.23 |
+| regex FS + arrays | 0.08 | 0.08 | 0.12 |
+| printf | 0.22 | 0.22 | 0.35 |
+
+What each change did, and the hawk time before it and after it on the
+field that moved (the others are in the commit message):
+
+* **Special variables live in fields, not the hash map** (`FS`, `RS`,
+  `NR`, `FNR`, `OFS`, `ORS`, `OFMT`, `CONVFMT`, `SUBSEP`). Bumping `NR`
+  is an addition, not an allocation. A numeric `FS` is still formatted
+  with the `CONVFMT` current at the read, not the one current when `FS`
+  was assigned. Regex filter 0.13 to 0.07.
+* **Fields are spans into the record.** Splitting records where each
+  field sits. Arithmetic parses the number off those bytes and remembers
+  it; the string value (a strnum when the whole field is numeric, so
+  `print $2` still shows `10.0`) is built only when something needs the
+  text. Plain integers skip the general float parser. Field sum 0.20 to
+  0.09, regex FS 0.22 to 0.15, printf 0.41 to 0.34.
+* **One copy of each record, and a word-at-a-time search for a one-byte
+  RS.** The reader used to copy the line into a `Vec` and the interpreter
+  copied it again into the `Rc` it stored. Regex filter 0.07 to 0.06.
+* **A repeated byte set splits by scanning.** `[ ]+` and `:+` are a run
+  of one byte. The DFA is still used for every other pattern, and in
+  UTF-8 mode for a set that contains a non-ASCII byte. Regex FS 0.14 to
+  0.13.
+* **Array updates borrow the key.** `c[$1]++` copied the key into an
+  `Rc` on every record, then hashed it with SipHash. The key is now
+  copied into a reused buffer and looked up borrowed; only a new key is
+  allocated. The hash is FxHash with a random per-array seed and a
+  finalizer. Without the finalizer the low bits, which `HashMap` uses
+  as the bucket index, were identical for keys that differ in the middle,
+  and inserts were quadratic (the `colliding_keys_stay_fast` test).
+  Regex FS 0.13 to 0.09.
+* **`gsub(/a/, "A")` overwrites the record in place** when the pattern
+  is a fixed string, the replacement is the same number of plain bytes,
+  and a saved `$0` does not share the buffer. `length($0)` counts the
+  buffer. Gsub 0.16 to 0.09 across this and the record-buffer change.
+* **A constant `printf` format is parsed once.** `%d` and `%f` receive
+  the number, so those fields are not turned into strings first. The
+  line is built in a buffer that is recycled. Printf 0.33 to 0.21.
+* **The last ordinary global stays in a field of the interpreter.**
+  `s += $2` was two hash lookups. A different expression that spells
+  `s` writes the value back to the map first, so `END` and a function
+  argument still see it. Field sum 0.08 to 0.07, now level with gawk.
+* **The current record is one reused `Vec`.** The next record is read
+  into a spare buffer and the two are swapped only when the read
+  succeeds, so end of input does not wipe `$0`. A value that escapes
+  (`x = $0`) is copied out. `END { print NR }` on the benchmark file is
+  0.022 s (mawk 0.007, gawk 0.037).
+* **`panic = "abort"` in the release profile.** Times did not move. The
+  binary went from about 1.1 MiB to 993,000 bytes.
+
+### What is left, and what a compiler would buy
+
+The programs that were allocation-bound are now close to mawk: regex FS
+matches it, printf is level with it, the regex filter is 0.06 against
+0.05, field sum matches gawk and is 1.4 times mawk. Gsub is 0.09 against
+mawk's 0.05 and gawk's 0.20.
+
+The gap that is still hawk's, rather than the work itself, is the walk.
+`END { print NR }` does not look at a field and still takes 0.022 s
+against mawk's 0.007: read the line, add one to `NR`, repeat. A sampling
+of that run is the record loop and the `match` on the (empty) rule list.
+Field sum adds a span scan and an integer parse on top of that, which is
+why it is 0.07 rather than 0.022; mawk's field sum is 0.05, so most of
+hawk's remaining distance to mawk on that program is the loop, not the
+addition.
+
+Closing that means compiling the tree, which this round does not do.
+
+* **Slots for every variable**, not just the last one touched. A pass
+  over the tree gives each name a number. `get` and `set` index a `Vec`.
+  The one-name cache above is that idea for the single hot name. Doing
+  it for all names removes the write-back when `END` uses a different
+  copy of the same letters, and it is the storage a compiler wants
+  anyway.
+* **Closures or bytecode.** pyawk turns each expression into a Python
+  function before running. The Rust equivalent is either a closure per
+  node (awkward, because the closure has to hold a mutable interpreter)
+  or a small bytecode the main loop switches on: load slot, add, store
+  slot, next record. The `match` on `Expr` and the stack check on every
+  node go away. Control flow (`next`, `break`, `exit`) is a jump or a
+  status code, which hawk already uses a status code for.
+* **What it would not speed up.** Printf's digits, the DFA scan in the
+  regex filter (already 0.06 against 0.05), and the array update (already
+  level with mawk) are the work, not the walk. A compiler does not make
+  those much faster. Gsub of a one-byte literal is already an in-place
+  scan; the remaining factor of about two against mawk is the loop
+  around it plus `length`.
+* **Expected gain.** On field sum and on `END { print NR }`, in the
+  neighbourhood of the gap that is left: field sum from 0.07 toward
+  mawk's 0.05, and the empty record loop from 0.022 toward something
+  closer to 0.01, if the reader stays a copy out of a 64 KiB chunk. Not
+  a further halving of printf or the regex filter. The cost is a second
+  implementation of every expression, which has to stay in lockstep with
+  the tree walk or replace it. That is the point at which this round
+  stopped.

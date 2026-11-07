@@ -26,14 +26,14 @@ use crate::array::{Array, FxMap, Key};
 use crate::ast::{BinOp, CmpOp, Expr, Function, GetlineKind, Program, Redirect, Stmt, UnOp};
 use crate::charset;
 use crate::error::Error;
-use crate::format::format_printf;
+use crate::format::{CompiledFormat, FmtArg, compile_format, format_compiled};
 use crate::input::{RecordReader, RegexFinder};
 use crate::io::{Io, strerror};
 use crate::lexer::{Builtin, process_escapes};
 use crate::rand::Random;
 use crate::regex::{Finder, Regex, Transcoding, nfa_limit};
-use crate::subst::{split_regex, substitute};
-use crate::value::{Value, compare, empty, num_to_str};
+use crate::subst::{split_regex, split_regex_spans, substitute};
+use crate::value::{Value, compare, empty, looks_numeric, num_to_str, str_to_num};
 
 /// An array shared by reference: `Rc` lets several owners (a global and a
 /// function parameter) hold the same array; `RefCell` lets us change it
@@ -149,6 +149,28 @@ enum Main {
 /// Most compiled regexes kept in the cache (pyawk's CACHE_ENTRIES).
 const REGEX_CACHE_ENTRIES: usize = 512;
 
+/// The fields of the current record.
+///
+/// Splitting only records where each field sits inside `Interp::record`.
+/// The `Value` (a reference-counted string, and the parsed number if the
+/// text looks numeric) is built the first time something needs the field
+/// *as a value*: printing it, assigning it, using it as an array key.
+/// Arithmetic never does that.  `s += $2` parses the number straight off
+/// the record bytes and stores it in `nums`, so a tight sum does not
+/// allocate one string per field per line.
+struct Fields {
+    spans: Vec<(usize, usize)>,
+    values: Vec<Option<Value>>,
+    nums: Vec<Option<f64>>,
+    /// `spans`/`values` describe this record.  False until `$n` or NF is
+    /// used; assigning `$0` clears it so the next use splits again.
+    ready: bool,
+    /// A field was assigned (or NF was).  The values are then the source
+    /// of truth and `spans` may no longer match `record`, because `$0`
+    /// was rebuilt by joining the values with OFS.
+    owned: bool,
+}
+
 /// The settings that come from the command line.
 #[derive(Default)]
 pub struct Config {
@@ -176,11 +198,25 @@ pub struct Interp<'p> {
     io: Io,
 
     // ---- the current record
-    record: Rc<[u8]>,
-    /// `$0` as a value, made on first use (a strnum unless assigned a string).
+    /// The current record's bytes.  One buffer, reused for every record:
+    /// allocating a fresh string per line was most of what was left of the
+    /// record loop after the fields stopped allocating.  A value that
+    /// escapes (`x = $0`) copies out of here, so the next record can
+    /// overwrite the buffer.
+    record: Vec<u8>,
+    /// The other half of the record buffer.  The next record is read into
+    /// this, and the two are swapped only when the read succeeds, so a
+    /// failed read (end of input) does not wipe `$0`.
+    record_swap: Vec<u8>,
+    /// `$0` as a value, made on first use (a strnum unless it was assigned
+    /// a string or `sub`/`gsub` replaced something).
     record_value: Option<Value>,
+    /// `$0` must come back as a plain string, not a strnum, even when the
+    /// bytes look numeric.  Set by assigning a string to `$0` and by a
+    /// substitution that changed it.
+    record_is_string: bool,
     /// The fields, split on first use (lazy splitting).
-    fields: Option<Vec<Value>>,
+    fields: Fields,
     /// FS when the record was read: it applies to this record even if the
     /// program changes FS before splitting happens.
     record_fs: Rc<[u8]>,
@@ -215,6 +251,54 @@ pub struct Interp<'p> {
 
     /// UTF-8 mode (from `Config::utf8`).
     utf8: bool,
+
+    /// Built-in scalars the record loop reads or writes on every line
+    /// (FS, RS, NR, ...).  They are kept here instead of in `globals` so
+    /// that touching them is a field access, not a hash lookup, and so
+    /// `NR++` does not allocate a fresh key.  Every other global still
+    /// lives in the map.  A name is in at most one of the two places.
+    fs: Value,
+    rs: Value,
+    ofs: Value,
+    ors: Value,
+    ofmt: Value,
+    convfmt_v: Value,
+    subsep: Value,
+    nr: Value,
+    fnr: Value,
+
+    /// Scratch for an array subscript, reused every time so `c[$1]++`
+    /// does not allocate a key just to look the element up.  Grown to the
+    /// longest key seen and then kept.
+    key_buf: Vec<u8>,
+    /// The global array named by the bytes at `arr_ptr` (an AST string,
+    /// stable for the whole run).  One program refers to the same array
+    /// from the same expression on every record; the pointer compare
+    /// skips the hash lookup of the name.
+    arr_ptr: *const u8,
+    arr_len: usize,
+    arr_cache: Option<ArrayRef>,
+
+    /// Buffer recycled across `printf` lines, so each line is not a fresh
+    /// allocation.  Taken out for the duration of one `printf` (an
+    /// argument may itself `printf`), then put back.
+    spare: Vec<u8>,
+    /// Compiled form of the format string whose bytes live at `fmt_ptr`
+    /// (a constant in the program).  The pointer is stable for the run.
+    fmt_ptr: *const u8,
+    fmt_len: usize,
+    fmt_compiled: CompiledFormat,
+
+    /// The last ordinary global read or written, kept here so `s += $2`
+    /// does not hash the name on every record.  `sc_name` is the same
+    /// letters, remembered so the value can be written back to `globals`
+    /// when a *different* expression (a different copy of the name in the
+    /// syntax tree) uses it.  Specials and arrays are not cached.
+    sc_on: bool,
+    sc_ptr: *const u8,
+    sc_len: usize,
+    sc_name: String,
+    sc_val: Value,
 }
 
 /// True for `name=value` operands: the name is an AWK identifier.
@@ -273,9 +357,17 @@ impl<'p> Interp<'p> {
             ret: Value::Uninit,
             exit_code: 0,
             io: Io::new(),
-            record: empty(),
+            record: Vec::new(),
+            record_swap: Vec::new(),
             record_value: None,
-            fields: None,
+            record_is_string: false,
+            fields: Fields {
+                spans: Vec::new(),
+                values: Vec::new(),
+                nums: Vec::new(),
+                ready: false,
+                owned: false,
+            },
             record_fs: Rc::from(&b" "[..]),
             main: Main::None,
             argi: 1,
@@ -296,19 +388,34 @@ impl<'p> Interp<'p> {
                 budget + (Self::stack_size(config) - budget) / 2
             },
             utf8: config.utf8,
+            // POSIX defaults.  Strings, not numbers: their text does not
+            // depend on CONVFMT (a numeric FS would; see `special_str`).
+            fs: Value::str(b" "),
+            rs: Value::str(b"\n"),
+            ofs: Value::str(b" "),
+            ors: Value::str(b"\n"),
+            ofmt: Value::str(b"%.6g"),
+            convfmt_v: Value::str(b"%.6g"),
+            subsep: Value::str(b"\x1c"),
+            nr: Value::Num(0.0),
+            fnr: Value::Num(0.0),
+            key_buf: Vec::new(),
+            arr_ptr: std::ptr::null(),
+            arr_len: 0,
+            arr_cache: None,
+            spare: Vec::new(),
+            fmt_ptr: std::ptr::null(),
+            fmt_len: 0,
+            fmt_compiled: CompiledFormat::default(),
+            sc_on: false,
+            sc_ptr: std::ptr::null(),
+            sc_len: 0,
+            sc_name: String::new(),
+            sc_val: Value::Uninit,
         };
         let s = |t: &str| Var::Scalar(Value::str(t.as_bytes()));
         let n = |x: f64| Var::Scalar(Value::Num(x));
         for (name, v) in [
-            ("FS", s(" ")),
-            ("OFS", s(" ")),
-            ("ORS", s("\n")),
-            ("RS", s("\n")),
-            ("NR", n(0.0)),
-            ("FNR", n(0.0)),
-            ("SUBSEP", s("\x1c")),
-            ("CONVFMT", s("%.6g")),
-            ("OFMT", s("%.6g")),
             ("RSTART", n(0.0)),
             ("RLENGTH", n(-1.0)),
             ("FILENAME", s("")),
@@ -403,10 +510,10 @@ impl<'p> Interp<'p> {
     /// Read every main input record and run the pattern-action rules on
     /// it (`next` and `nextfile` end the rules early).
     fn main_loop(&mut self) -> R<()> {
-        while let Some(rec) = self.next_main_record()? {
+        while self.next_main_record()? {
             self.bump("NR");
             self.bump("FNR");
-            self.set_record(Rc::from(rec));
+            self.note_record();
             match self.run_rules() {
                 // `next` inside a function called from a pattern or an
                 // action: abandon this record's rules just the same.
@@ -458,22 +565,33 @@ impl<'p> Interp<'p> {
         Ok(true)
     }
 
-    /// Add one to a numeric special variable (NR, FNR).
+    /// Add one to NR or FNR.  The result of the addition is a number, so
+    /// a string previously stored there (`NR = "hello"`) is replaced by
+    /// its numeric value plus one, which is what `NR = NR + 1` does.
     fn bump(&mut self, name: &str) {
-        let n = self.var_num(name);
-        self.globals
-            .insert(name.to_string(), Var::Scalar(Value::Num(n + 1.0)));
+        let Some(slot) = self.special_slot_mut(name) else {
+            // Only NR and FNR are bumped.  Kept so a future caller still
+            // does the obvious thing.
+            let n = self.var_num(name) + 1.0;
+            let _ = self.set_global(name, Value::Num(n));
+            return;
+        };
+        let n = slot.to_num() + 1.0;
+        *slot = Value::Num(n);
     }
 
     // ============================================================ input
 
-    /// The next record of the main input (the operands, else stdin).
-    fn next_main_record(&mut self) -> R<Option<Vec<u8>>> {
+    /// Read the next main-input record into `out` (cleared by the reader).
+    /// `Ok(false)` when the input is finished.  Does not touch `$0`: the
+    /// caller decides whether this record replaces it (`getline var` must
+    /// not).
+    fn read_main(&mut self, out: &mut Vec<u8>) -> R<bool> {
         loop {
             if let Main::None = self.main
                 && !self.open_next_input()?
             {
-                return Ok(None);
+                return Ok(false);
             }
             let rs = self.var_str("RS");
             let re = self.rs_regex(&rs)?;
@@ -481,16 +599,28 @@ impl<'p> Interp<'p> {
                 re.as_deref().and_then(|r| Finder::cached(r, t, c).find(p))
             };
             let finder: Option<RegexFinder> = re.is_some().then_some(&find);
-            let rec = match &mut self.main {
-                Main::Stdin => self.io.stdin_reader().read_record(&rs, finder)?,
-                Main::File(r) => r.read_record(&rs, finder)?,
-                Main::None => None,
+            let got = match &mut self.main {
+                Main::Stdin => self.io.stdin_reader().read_record_into(&rs, finder, out)?,
+                Main::File(r) => r.read_record_into(&rs, finder, out)?,
+                Main::None => false,
             };
-            match rec {
-                Some(r) => return Ok(Some(r)),
-                None => self.main = Main::None,
+            if got {
+                return Ok(true);
             }
+            self.main = Main::None;
         }
+    }
+
+    /// Read the next record into `self.record`.  `Ok(false)` at the end.
+    fn next_main_record(&mut self) -> R<bool> {
+        let mut rec = std::mem::take(&mut self.record_swap);
+        let got = self.read_main(&mut rec)?;
+        if got {
+            self.record_swap = std::mem::replace(&mut self.record, rec);
+        } else {
+            self.record_swap = rec;
+        }
+        Ok(got)
     }
 
     /// `nextfile`: drop the rest of the current input file, so the next
@@ -564,24 +694,126 @@ impl<'p> Interp<'p> {
 
     // ===================================================== records, fields
 
-    /// Install a new `$0`; fields are split when first needed.
-    fn set_record(&mut self, text: Rc<[u8]>) {
-        self.record = text;
+    /// Install `text` as `$0`, reusing the record buffer.  Fields are
+    /// split when first needed.  `text` must not borrow `self.record`.
+    fn set_record(&mut self, text: &[u8]) {
+        if self.record.as_ptr() != text.as_ptr() {
+            let mut rec = std::mem::take(&mut self.record);
+            rec.clear();
+            rec.extend_from_slice(text);
+            self.record = rec;
+        }
         self.record_value = None;
-        self.fields = None;
+        self.record_is_string = false;
+        self.fields.ready = false;
+        self.fields.owned = false;
         self.record_fs = self.var_str("FS");
     }
 
-    /// Split `$0` if not done yet; returns the fields.
-    fn split_record(&mut self) -> R<&mut Vec<Value>> {
-        if self.fields.is_none() {
-            let paragraph = self.var_str("RS").is_empty();
-            let fs = self.record_fs.clone();
-            let pieces = self.split_with_fs(&self.record.clone(), &fs, paragraph)?;
-            self.fields = Some(pieces.iter().map(|p| Value::strnum(p)).collect());
+    /// The record buffer already holds the next record (see
+    /// `next_main_record`).  Forget the previous split and `$0` value.
+    fn note_record(&mut self) {
+        self.record_value = None;
+        self.record_is_string = false;
+        self.fields.ready = false;
+        self.fields.owned = false;
+        self.record_fs = self.var_str("FS");
+    }
+
+    /// Split `$0` if not done yet.  The spans keep the capacity of the
+    /// previous record's vector, so a file of similar lines does not
+    /// allocate a new one per record.
+    fn ensure_fields(&mut self) -> R<()> {
+        if self.fields.ready {
+            return Ok(());
         }
-        // `unwrap` is safe: the line above made sure it is `Some`.
-        Ok(self.fields.as_mut().unwrap())
+        let paragraph = self.var_str("RS").is_empty();
+        let fs = self.record_fs.clone();
+        // Move the bytes out so `fill_spans` can borrow them and `self`
+        // at the same time (a regex FS compiles while it splits).  Moving
+        // a `Vec` does not copy the bytes.
+        let rec = std::mem::take(&mut self.record);
+        let mut spans = std::mem::take(&mut self.fields.spans);
+        spans.clear();
+        let filled = self.fill_spans(&rec, &fs, paragraph, &mut spans);
+        self.record = rec;
+        filled?;
+        let n = spans.len();
+        self.fields.spans = spans;
+        self.fields.values.clear();
+        self.fields.values.resize(n, None);
+        self.fields.nums.clear();
+        self.fields.nums.resize(n, None);
+        self.fields.ready = true;
+        self.fields.owned = false;
+        Ok(())
+    }
+
+    /// Append the field spans of `s` to `out`.  Same FS rules as
+    /// `split_with_fs`.
+    fn fill_spans(
+        &mut self,
+        s: &[u8],
+        fs: &[u8],
+        paragraph: bool,
+        out: &mut Vec<(usize, usize)>,
+    ) -> R<()> {
+        if fs == b" " {
+            // Default FS: runs of blank, tab and newline, and the empties
+            // between them are not fields.  Newline is already in that
+            // set, so paragraph mode adds nothing here.
+            let n = s.len();
+            let mut i = 0;
+            while i < n {
+                while i < n && matches!(s[i], b' ' | b'\t' | b'\n') {
+                    i += 1;
+                }
+                if i == n {
+                    break;
+                }
+                let start = i;
+                while i < n && !matches!(s[i], b' ' | b'\t' | b'\n') {
+                    i += 1;
+                }
+                out.push((start, i));
+            }
+            return Ok(());
+        }
+        if s.is_empty() {
+            return Ok(());
+        }
+        if fs.is_empty() {
+            // One field per character.
+            let mut i = 0;
+            while i < s.len() {
+                let j = charset::next(s, i, self.utf8);
+                out.push((i, j));
+                i = j;
+            }
+            return Ok(());
+        }
+        if fs.len() == 1 {
+            let c = fs[0];
+            let mut start = 0;
+            for (i, &b) in s.iter().enumerate() {
+                if b == c || (paragraph && b == b'\n') {
+                    out.push((start, i));
+                    start = i + 1;
+                }
+            }
+            out.push((start, s.len()));
+            return Ok(());
+        }
+        let re = if paragraph {
+            let mut src = b"\n|(".to_vec();
+            src.extend_from_slice(fs);
+            src.push(b')');
+            self.regex(&src)?
+        } else {
+            self.regex(fs)?
+        };
+        out.extend(split_regex_spans(&re, s));
+        Ok(())
     }
 
     /// Split `s` by the FS rules (also used by `split()`):
@@ -594,43 +826,26 @@ impl<'p> Interp<'p> {
     ///
     /// In paragraph mode (RS = "") a newline also separates fields.
     fn split_with_fs(&mut self, s: &[u8], fs: &[u8], paragraph: bool) -> R<Vec<Vec<u8>>> {
-        if fs == b" " {
-            return Ok(s
-                .split(|&b| b == b' ' || b == b'\t' || b == b'\n')
-                .filter(|p| !p.is_empty())
-                .map(|p| p.to_vec())
-                .collect());
+        let mut spans = Vec::new();
+        self.fill_spans(s, fs, paragraph, &mut spans)?;
+        Ok(spans.into_iter().map(|(a, b)| s[a..b].to_vec()).collect())
+    }
+
+    /// Build a `Value` for every field that does not have one yet, and
+    /// remember that the values (not the spans) are now authoritative.
+    /// Assigning a field or NF does this, because the rebuilt `$0` is the
+    /// values joined with OFS and may no longer split the same way.
+    fn materialize_fields(&mut self) {
+        if self.fields.owned {
+            return;
         }
-        if s.is_empty() {
-            return Ok(Vec::new());
-        }
-        if fs.is_empty() {
-            // One field per character.
-            let mut out = Vec::new();
-            let mut i = 0;
-            while i < s.len() {
-                let j = charset::next(s, i, self.utf8);
-                out.push(s[i..j].to_vec());
-                i = j;
+        for i in 0..self.fields.spans.len() {
+            if self.fields.values[i].is_none() {
+                let (a, b) = self.fields.spans[i];
+                self.fields.values[i] = Some(Value::strnum(&self.record[a..b]));
             }
-            return Ok(out);
         }
-        if fs.len() == 1 {
-            let c = fs[0];
-            return Ok(s
-                .split(|&b| b == c || (paragraph && b == b'\n'))
-                .map(|p| p.to_vec())
-                .collect());
-        }
-        let re = if paragraph {
-            let mut src = b"\n|(".to_vec();
-            src.extend_from_slice(fs);
-            src.push(b')');
-            self.regex(&src)?
-        } else {
-            self.regex(fs)?
-        };
-        Ok(split_regex(&re, s))
+        self.fields.owned = true;
     }
 
     // ============================================================ regexes
@@ -675,18 +890,66 @@ impl<'p> Interp<'p> {
 
     /// `$i`.  A field past NF is the empty *string* (not uninitialized),
     /// as in all three reference awks.
+    ///
+    /// `$0` is copied out of the record buffer the first time it is needed
+    /// as a value, so the next record can reuse the buffer.  A field that
+    /// so far was only used as a number still has no `Value`; this builds
+    /// one from the span (a strnum when the whole field is numeric).
     fn get_field(&mut self, i: usize) -> R<Value> {
         if i == 0 {
             if self.record_value.is_none() {
-                self.record_value = Some(Value::strnum(&self.record));
+                // A copy: the record buffer is overwritten by the next
+                // line, and this value must keep these bytes.
+                let rc: Rc<[u8]> = Rc::from(&self.record[..]);
+                self.record_value = Some(if self.record_is_string {
+                    Value::Str(rc)
+                } else {
+                    match looks_numeric(&self.record) {
+                        Some(n) => Value::StrNum(rc, n),
+                        None => Value::Str(rc),
+                    }
+                });
             }
             return Ok(self.record_value.clone().unwrap());
         }
-        let fields = self.split_record()?;
-        Ok(match fields.get(i - 1) {
-            Some(v) => v.clone(),
-            None => Value::Str(empty()),
-        })
+        self.ensure_fields()?;
+        let idx = i - 1;
+        if idx >= self.fields.values.len() {
+            return Ok(Value::Str(empty()));
+        }
+        if self.fields.values[idx].is_none() {
+            let (a, b) = self.fields.spans[idx];
+            self.fields.values[idx] = Some(Value::strnum(&self.record[a..b]));
+        }
+        Ok(self.fields.values[idx].clone().unwrap())
+    }
+
+    /// `$i` as a number, without building a string for it.
+    ///
+    /// The numeric value of a field is `str_to_num` of its text, whether
+    /// or not the whole field is a "numeric string".  The result is
+    /// remembered, so a second use of the same field does not parse again.
+    fn field_num(&mut self, i: usize) -> R<f64> {
+        if i == 0 {
+            return Ok(self.get_field(0)?.to_num());
+        }
+        self.ensure_fields()?;
+        let idx = i - 1;
+        if idx >= self.fields.nums.len() {
+            return Ok(0.0);
+        }
+        if let Some(n) = self.fields.nums[idx] {
+            return Ok(n);
+        }
+        if let Some(v) = &self.fields.values[idx] {
+            let n = v.to_num();
+            self.fields.nums[idx] = Some(n);
+            return Ok(n);
+        }
+        let (a, b) = self.fields.spans[idx];
+        let n = str_to_num(&self.record[a..b]);
+        self.fields.nums[idx] = Some(n);
+        Ok(n)
     }
 
     /// Assign `$i`.  `$0` re-splits; any other field rebuilds `$0` from
@@ -695,17 +958,24 @@ impl<'p> Interp<'p> {
     fn set_field(&mut self, i: usize, v: Value) -> R<()> {
         if i == 0 {
             let text = self.to_str(&v);
-            self.set_record(text);
-            if v.is_str() {
+            let is_str = v.is_str();
+            self.set_record(&text);
+            if is_str {
+                self.record_is_string = true;
                 self.record_value = Some(v);
             }
             return Ok(());
         }
-        let fields = self.split_record()?;
-        while fields.len() < i {
-            fields.push(Value::Str(empty()));
+        self.ensure_fields()?;
+        self.materialize_fields();
+        while self.fields.values.len() < i {
+            self.fields.values.push(Some(Value::Str(empty())));
+            self.fields.nums.push(Some(0.0));
         }
-        fields[i - 1] = v;
+        let n = v.to_num();
+        self.fields.nums[i - 1] = Some(n);
+        self.fields.values[i - 1] = Some(v);
+        self.fields.owned = true;
         self.rebuild_record();
         Ok(())
     }
@@ -715,21 +985,25 @@ impl<'p> Interp<'p> {
         let ofs = self.var_str("OFS");
         let convfmt = self.convfmt();
         let mut rec = Vec::new();
-        if let Some(fields) = &self.fields {
-            for (k, f) in fields.iter().enumerate() {
-                if k > 0 {
-                    rec.extend_from_slice(&ofs);
-                }
-                rec.extend_from_slice(&f.to_str(&convfmt));
+        for (k, f) in self.fields.values.iter().enumerate() {
+            if k > 0 {
+                rec.extend_from_slice(&ofs);
             }
+            // `unwrap`: `materialize_fields` (or `set_field` extending
+            // the list) stored a value in every slot before this runs.
+            rec.extend_from_slice(&f.as_ref().unwrap().to_str(&convfmt));
         }
-        let rec: Rc<[u8]> = Rc::from(rec);
-        self.record = rec.clone();
-        self.record_value = Some(Value::Str(rec));
+        let rc: Rc<[u8]> = Rc::from(&rec[..]);
+        self.record = rec;
+        self.record_is_string = true;
+        self.record_value = Some(Value::Str(rc));
+        self.fields.owned = true;
+        self.fields.ready = true;
     }
 
     fn get_nf(&mut self) -> R<f64> {
-        Ok(self.split_record()?.len() as f64)
+        self.ensure_fields()?;
+        Ok(self.fields.values.len() as f64)
     }
 
     /// Assigning NF truncates or extends the fields and rebuilds `$0`.
@@ -739,19 +1013,21 @@ impl<'p> Interp<'p> {
             return rt(format!("NF set to negative value {}", n.trunc() as i64));
         }
         let n = if n.is_finite() { n as usize } else { 0 };
-        let fields = self.split_record()?;
-        fields.truncate(n);
-        while fields.len() < n {
-            fields.push(Value::Str(empty()));
+        self.ensure_fields()?;
+        self.materialize_fields();
+        self.fields.values.truncate(n);
+        self.fields.nums.truncate(n);
+        while self.fields.values.len() < n {
+            self.fields.values.push(Some(Value::Str(empty())));
+            self.fields.nums.push(Some(0.0));
         }
         self.rebuild_record();
         Ok(())
     }
 
-    /// Field number from a value: truncated; NaN and inf are errors,
+    /// Field number from a number: truncated; NaN and inf are errors,
     /// negative numbers are out of range.
-    fn field_number(&self, v: &Value) -> R<usize> {
-        let n = v.to_num();
+    fn field_index(&self, n: f64) -> R<usize> {
         if !n.is_finite() {
             return rt("invalid field index");
         }
@@ -760,6 +1036,12 @@ impl<'p> Interp<'p> {
             return rt(format!("trying to access out of range field {}", i as i64));
         }
         Ok(i as usize)
+    }
+
+    /// Field number from a value: truncated; NaN and inf are errors,
+    /// negative numbers are out of range.
+    fn field_number(&self, v: &Value) -> R<usize> {
+        self.field_index(v.to_num())
     }
 
     // ========================================================= variables
@@ -777,8 +1059,65 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// One of the scalars stored beside the map (see `Interp::fs`), or
+    /// `None` when `name` is an ordinary global.
+    fn special_slot(&self, name: &str) -> Option<&Value> {
+        Some(match name {
+            "FS" => &self.fs,
+            "RS" => &self.rs,
+            "OFS" => &self.ofs,
+            "ORS" => &self.ors,
+            "OFMT" => &self.ofmt,
+            "CONVFMT" => &self.convfmt_v,
+            "SUBSEP" => &self.subsep,
+            "NR" => &self.nr,
+            "FNR" => &self.fnr,
+            _ => return None,
+        })
+    }
+
+    fn special_slot_mut(&mut self, name: &str) -> Option<&mut Value> {
+        Some(match name {
+            "FS" => &mut self.fs,
+            "RS" => &mut self.rs,
+            "OFS" => &mut self.ofs,
+            "ORS" => &mut self.ors,
+            "OFMT" => &mut self.ofmt,
+            "CONVFMT" => &mut self.convfmt_v,
+            "SUBSEP" => &mut self.subsep,
+            "NR" => &mut self.nr,
+            "FNR" => &mut self.fnr,
+            _ => return None,
+        })
+    }
+
+    /// String value of a built-in scalar.
+    ///
+    /// A string or strnum is shared (an `Rc` clone, no copying of bytes).
+    /// A number is formatted now, with the CONVFMT current at this call:
+    /// `BEGIN { FS = 1/3; CONVFMT = "%.2f" }` makes FS split on `0.33`,
+    /// not on the `0.333333` it would have had when it was assigned.
+    /// CONVFMT itself, when it is a number, is formatted with `%.6g` so
+    /// this does not recurse.
+    fn special_str(&self, name: &str) -> Option<Rc<[u8]>> {
+        let n = match self.special_slot(name)? {
+            Value::Uninit => return Some(empty()),
+            Value::Str(s) | Value::StrNum(s, _) => return Some(s.clone()),
+            Value::Num(n) => *n,
+        };
+        let fmt = if name == "CONVFMT" {
+            Rc::from(&b"%.6g"[..])
+        } else {
+            self.convfmt()
+        };
+        Some(Rc::from(num_to_str(n, &fmt)))
+    }
+
     /// A global's string value (for FS, OFS, ORS, RS, SUBSEP, ...).
     fn var_str(&self, name: &str) -> Rc<[u8]> {
+        if let Some(s) = self.special_str(name) {
+            return s;
+        }
         match self.globals.get(name) {
             Some(Var::Scalar(Value::Num(n))) => {
                 let fmt = if name == "CONVFMT" {
@@ -794,6 +1133,9 @@ impl<'p> Interp<'p> {
     }
 
     fn var_num(&self, name: &str) -> f64 {
+        if let Some(v) = self.special_slot(name) {
+            return v.to_num();
+        }
         match self.globals.get(name) {
             Some(Var::Scalar(v)) => v.to_num(),
             _ => 0.0,
@@ -806,11 +1148,74 @@ impl<'p> Interp<'p> {
         frame.params.iter().position(|p| p == name)
     }
 
-    /// Read a global scalar.  The first read of an unset name makes it a
-    /// scalar (it can no longer become an array).
+    /// Write the cached global back into the map.  Cheap when the cache
+    /// is empty; otherwise one map update.  Called when a different name,
+    /// or the same name from a different expression, is about to be used,
+    /// and before any read of the map that bypasses the cache.
+    fn store_scalar(&mut self) {
+        if !self.sc_on {
+            return;
+        }
+        let v = self.sc_val.clone();
+        if let Some(Var::Scalar(slot)) = self.globals.get_mut(self.sc_name.as_str()) {
+            *slot = v;
+        }
+    }
+
+    /// True when `name` is the scalar already in the cache.
+    ///
+    /// The pointer and the length are not enough.  `-v aa=1 -v bb=2`
+    /// builds each name in a temporary, and the allocator can hand the
+    /// second name the same address as the first.  The letters have to
+    /// match too, or `bb` would be written into `aa`.
+    fn scalar_is_cached(&self, name: &str) -> bool {
+        self.sc_on
+            && self.sc_ptr == name.as_ptr()
+            && self.sc_len == name.len()
+            && self.sc_name == name
+    }
+
+    /// Point the cache at `name`, which is an ordinary scalar.  No work
+    /// when this expression's name is already the one cached.
+    fn touch_scalar(&mut self, name: &str) {
+        let p = name.as_ptr();
+        if self.scalar_is_cached(name) {
+            return;
+        }
+        self.store_scalar();
+        self.sc_on = false;
+        if self.special_slot(name).is_some() || name == "NF" {
+            return;
+        }
+        let v = match self.globals.get(name) {
+            Some(Var::Scalar(v)) => v.clone(),
+            // An array, or a missing name that might still become one:
+            // leave it to the caller.  A missing name used as a scalar is
+            // created below.
+            Some(Var::Array(_)) => return,
+            None => {
+                self.globals
+                    .insert(name.to_string(), Var::Scalar(Value::Uninit));
+                Value::Uninit
+            }
+        };
+        self.sc_ptr = p;
+        self.sc_len = name.len();
+        self.sc_name = name.to_string();
+        self.sc_val = v;
+        self.sc_on = true;
+    }
+
     fn get_global(&mut self, name: &str) -> R<Value> {
         if name == "NF" {
             return Ok(Value::Num(self.get_nf()?));
+        }
+        if let Some(v) = self.special_slot(name) {
+            return Ok(v.clone());
+        }
+        self.touch_scalar(name);
+        if self.scalar_is_cached(name) {
+            return Ok(self.sc_val.clone());
         }
         match self.globals.get(name) {
             Some(Var::Scalar(v)) => Ok(v.clone()),
@@ -826,6 +1231,15 @@ impl<'p> Interp<'p> {
     fn set_global(&mut self, name: &str, v: Value) -> R<()> {
         if name == "NF" {
             return self.set_nf(&v);
+        }
+        if let Some(slot) = self.special_slot_mut(name) {
+            *slot = v;
+            return Ok(());
+        }
+        self.touch_scalar(name);
+        if self.scalar_is_cached(name) {
+            self.sc_val = v;
+            return Ok(());
         }
         match self.globals.get_mut(name) {
             Some(Var::Array(_)) => rt(format!("can't assign to {name}; it's an array name")),
@@ -863,10 +1277,14 @@ impl<'p> Interp<'p> {
 
     /// The global array `name`, created empty on first use.
     fn global_array(&mut self, name: &str) -> R<ArrayRef> {
+        if name == "NF" || self.special_slot(name).is_some() {
+            return rt(format!("can't use scalar {name} as array"));
+        }
+        // The cached scalar, if this is its name, is the current value.
+        self.store_scalar();
         match self.globals.get(name) {
             Some(Var::Array(a)) => Ok(a.clone()),
             Some(Var::Scalar(_)) => rt(format!("can't use scalar {name} as array")),
-            None if name == "NF" => rt("can't use scalar NF as array"),
             None => {
                 let a: ArrayRef = Rc::default();
                 self.globals.insert(name.to_string(), Var::Array(a.clone()));
@@ -898,8 +1316,102 @@ impl<'p> Interp<'p> {
     fn array(&mut self, name: &str) -> R<ArrayRef> {
         match self.local_index(name) {
             Some(slot) => self.cell_array(self.frames.len() - 1, slot, name),
-            None => self.global_array(name),
+            None => self.cached_global_array(name),
         }
+    }
+
+    /// `global_array`, remembering the answer for this exact name (the
+    /// pointer of the AST string, not just the letters).  A different
+    /// expression that spells the same name misses once and then hits.
+    fn cached_global_array(&mut self, name: &str) -> R<ArrayRef> {
+        let p = name.as_ptr();
+        if self.arr_ptr == p && self.arr_len == name.len() {
+            return Ok(self.arr_cache.as_ref().unwrap().clone());
+        }
+        let a = self.global_array(name)?;
+        self.arr_ptr = p;
+        self.arr_len = name.len();
+        self.arr_cache = Some(a.clone());
+        Ok(a)
+    }
+
+    /// Append one subscript's key text to `key_buf`.  A field is copied
+    /// off the record; anything else is evaluated and stringified.
+    /// Evaluate `e` without losing `key_buf`.
+    ///
+    /// The subscript of `a[f($2)]++` is evaluated while that key is being
+    /// built.  `f` may itself do `c[$1]++`, which uses the same buffer.
+    /// The outer key is set aside for the call and put back afterwards.
+    fn eval_keeping_key(&mut self, e: &'p Expr) -> R<Value> {
+        let saved = std::mem::take(&mut self.key_buf);
+        let v = self.eval(e);
+        self.key_buf = saved;
+        v
+    }
+
+    fn append_key_piece(&mut self, e: &'p Expr) -> R<()> {
+        if let Expr::Field(index) = e {
+            let i = match index.as_ref() {
+                Expr::Num(n) => self.field_index(*n)?,
+                _ => {
+                    let v = self.eval_keeping_key(index)?;
+                    self.field_number(&v)?
+                }
+            };
+            return self.append_field_key(i);
+        }
+        let v = self.eval_keeping_key(e)?;
+        let s = self.to_str(&v);
+        self.key_buf.extend_from_slice(&s);
+        Ok(())
+    }
+
+    /// Append field `i`'s text to `key_buf`.  The text is the field as it
+    /// would print: the original bytes, or CONVFMT if the field was
+    /// assigned a number.
+    fn append_record_slice(&mut self, start: usize, end: usize) {
+        // `key_buf` and `record` are both fields, so one of them steps
+        // aside for the copy.
+        let mut key = std::mem::take(&mut self.key_buf);
+        key.extend_from_slice(&self.record[start..end]);
+        self.key_buf = key;
+    }
+
+    fn append_field_key(&mut self, i: usize) -> R<()> {
+        if i == 0 {
+            let n = self.record.len();
+            self.append_record_slice(0, n);
+            return Ok(());
+        }
+        self.ensure_fields()?;
+        let idx = i - 1;
+        if idx >= self.fields.values.len() {
+            return Ok(());
+        }
+        if let Some(v) = self.fields.values[idx].clone() {
+            let s = self.to_str(&v);
+            self.key_buf.extend_from_slice(&s);
+            return Ok(());
+        }
+        let (a, b) = self.fields.spans[idx];
+        self.append_record_slice(a, b);
+        Ok(())
+    }
+
+    /// The key of `a[i, j, ...]`, written into `key_buf` (cleared first).
+    fn fill_key(&mut self, subs: &'p [Expr]) -> R<()> {
+        self.key_buf.clear();
+        if let [one] = subs {
+            return self.append_key_piece(one);
+        }
+        let sep = self.var_str("SUBSEP");
+        for (k, e) in subs.iter().enumerate() {
+            if k > 0 {
+                self.key_buf.extend_from_slice(&sep);
+            }
+            self.append_key_piece(e)?;
+        }
+        Ok(())
     }
 
     /// "array", "scalar" or "untyped", without deciding an untyped name's
@@ -922,10 +1434,12 @@ impl<'p> Interp<'p> {
     }
 
     fn global_kind(&self, name: &str) -> Option<Option<ArrayRef>> {
+        if name == "NF" || self.special_slot(name).is_some() {
+            return None; // a scalar, already decided
+        }
         match self.globals.get(name) {
             Some(Var::Array(a)) => Some(Some(a.clone())),
             Some(Var::Scalar(_)) => None,
-            None if name == "NF" => None,
             None => Some(None),
         }
     }
@@ -1062,8 +1576,15 @@ impl<'p> Interp<'p> {
                     // mawk rejects it), but `printf > "f"` still opens f.
                     return self.output(redirect, b"").map(|()| Flow::Normal);
                 }
-                let text = self.sprintf(args)?;
-                self.output(redirect, &text)?;
+                // `spare` is empty while we hold `buf`, so a printf inside
+                // an argument gets its own buffer and cannot clobber this
+                // one.
+                let mut buf = std::mem::take(&mut self.spare);
+                buf.clear();
+                let wrote = self.printf_into(&mut buf, args);
+                let result = wrote.and_then(|()| self.output(redirect, &buf));
+                self.spare = buf;
+                result?;
             }
             Stmt::If { test, then, orelse } => {
                 if self.cond(test)? {
@@ -1172,14 +1693,78 @@ impl<'p> Interp<'p> {
         Ok(())
     }
 
+    /// Make `fmt_compiled` the parse of this constant format, if it is
+    /// not already.
+    fn ensure_format(&mut self, fmt: &[u8]) {
+        let p = fmt.as_ptr();
+        if self.fmt_ptr == p && self.fmt_len == fmt.len() {
+            return;
+        }
+        self.fmt_compiled = compile_format(fmt);
+        self.fmt_ptr = p;
+        self.fmt_len = fmt.len();
+    }
+
+    /// Append the printf of `args` (format first) to `out`.
+    ///
+    /// A constant format is parsed once.  `%d` and `%f` read a field as a
+    /// number, so `printf "%d", $2` does not allocate the field's text.
+    /// `%s` still needs that text.
+    fn printf_into(&mut self, out: &mut Vec<u8>, args: &'p [Expr]) -> R<()> {
+        let convfmt = self.convfmt();
+        let utf8 = self.utf8;
+        // Move the compiled pieces out of `self` so arguments can be
+        // evaluated (an argument may printf, and would use the same
+        // slot).  The move does not copy the text; putting the pieces
+        // back keeps them for the next record.
+        let (compiled, restore) = match args.first() {
+            Some(Expr::Str(fmt)) => {
+                self.ensure_format(fmt);
+                let ptr = self.fmt_ptr;
+                let len = self.fmt_len;
+                self.fmt_ptr = std::ptr::null();
+                (std::mem::take(&mut self.fmt_compiled), Some((ptr, len)))
+            }
+            Some(e) => {
+                let fmt = self.str_arg(e)?;
+                (compile_format(&fmt), None)
+            }
+            None => return Ok(()),
+        };
+        let mut i = 1; // args[0] is the format
+        let result: R<()> = format_compiled(out, &compiled, &convfmt, utf8, |kind| {
+            let Some(e) = args.get(i) else {
+                i += 1;
+                // A missing argument is not an unset variable: `%c` prints
+                // nothing rather than a NUL.  "" does that, and is 0 for
+                // the numeric conversions.
+                return Ok(Value::Str(empty()));
+            };
+            i += 1;
+            Ok(match kind {
+                FmtArg::Number => Value::Num(self.eval_num(e)?),
+                FmtArg::Value | FmtArg::Char => self.eval(e)?,
+            })
+        });
+        if let Some((ptr, len)) = restore {
+            self.fmt_compiled = compiled;
+            self.fmt_ptr = ptr;
+            self.fmt_len = len;
+        }
+        result?;
+        // `printf "x", i++` has nothing for `i++` to fill, but the
+        // argument is still evaluated.  The same for sprintf.
+        for e in args.iter().skip(i) {
+            self.eval(e)?;
+        }
+        Ok(())
+    }
+
     /// Evaluate `args` (the format first) and format them as printf does.
     fn sprintf(&mut self, args: &'p [Expr]) -> R<Vec<u8>> {
-        let mut vals = Vec::with_capacity(args.len());
-        for a in args {
-            vals.push(self.eval(a)?);
-        }
-        let fmt = self.to_str(&vals[0]);
-        Ok(format_printf(&fmt, &vals[1..], &self.convfmt(), self.utf8))
+        let mut out = Vec::new();
+        self.printf_into(&mut out, args)?;
+        Ok(out)
     }
 
     // ======================================================= expressions
@@ -1235,6 +1820,43 @@ impl<'p> Interp<'p> {
         Value::Num(if b { 1.0 } else { 0.0 })
     }
 
+    /// The numeric value of an expression, without building a string for
+    /// a field or a variable that is already a number.
+    ///
+    /// `s += $2` only needs this.  Building the field's `Value` would
+    /// copy its text into a fresh reference-counted string and throw that
+    /// away after reading the number.  Anything this does not recognise
+    /// (a function call, a comparison, a string) falls back to `eval`.
+    fn eval_num(&mut self, e: &'p Expr) -> R<f64> {
+        self.check_stack()?;
+        match e {
+            Expr::Num(n) => Ok(*n),
+            Expr::Field(index) => {
+                let i = match index.as_ref() {
+                    Expr::Num(n) => self.field_index(*n)?,
+                    _ => {
+                        let v = self.eval(index)?;
+                        self.field_number(&v)?
+                    }
+                };
+                self.field_num(i)
+            }
+            Expr::Var(name) => match self.local_index(name) {
+                Some(slot) => Ok(self.get_local(slot, name)?.to_num()),
+                None if name == "NF" => self.get_nf(),
+                None => Ok(match self.special_slot(name) {
+                    Some(v) => v.to_num(),
+                    None => self.get_global(name)?.to_num(),
+                }),
+            },
+            Expr::Binary(op, l, r) => arith(*op, self.eval_num(l)?, self.eval_num(r)?),
+            Expr::Unary(UnOp::Neg, x) => Ok(-self.eval_num(x)?),
+            Expr::Unary(UnOp::Plus, x) => self.eval_num(x),
+            Expr::Unary(UnOp::Not, x) => Ok(if self.cond(x)? { 0.0 } else { 1.0 }),
+            _ => Ok(self.eval(e)?.to_num()),
+        }
+    }
+
     pub fn eval(&mut self, e: &'p Expr) -> R<Value> {
         self.check_stack()?;
         Ok(match e {
@@ -1263,12 +1885,16 @@ impl<'p> Interp<'p> {
             Expr::Group(_) => return rt("parenthesised expression list used as a value"),
             Expr::Assign(op, target, value) => {
                 let place = self.place(target)?;
-                let rhs = self.eval(value)?;
+                // The target is resolved first, then the right-hand side,
+                // then (for `+=` and friends) the current value.  A
+                // function call on the right can change the variable, and
+                // the addition must see that new value.
                 let v = match op.0 {
-                    None => rhs,
+                    None => self.eval(value)?,
                     Some(bin) => {
+                        let rhs = self.eval_num(value)?;
                         let old = self.get_place(&place)?.to_num();
-                        Value::Num(arith(bin, old, rhs.to_num())?)
+                        Value::Num(arith(bin, old, rhs)?)
                     }
                 };
                 self.set_place(&place, v.clone())?;
@@ -1297,13 +1923,9 @@ impl<'p> Interp<'p> {
                 s.extend_from_slice(&b);
                 Value::Str(Rc::from(s))
             }
-            Expr::Binary(op, l, r) => {
-                let a = self.eval(l)?.to_num();
-                let b = self.eval(r)?.to_num();
-                Value::Num(arith(*op, a, b)?)
-            }
+            Expr::Binary(op, l, r) => Value::Num(arith(*op, self.eval_num(l)?, self.eval_num(r)?)?),
             Expr::Unary(op, x) => {
-                let n = self.eval(x)?.to_num();
+                let n = self.eval_num(x)?;
                 Value::Num(if *op == UnOp::Neg { -n } else { n })
             }
             Expr::IncDec {
@@ -1311,11 +1933,23 @@ impl<'p> Interp<'p> {
                 prefix,
                 target,
             } => {
-                let place = self.place(target)?;
-                let old = self.get_place(&place)?.to_num();
-                let new = if *incr { old + 1.0 } else { old - 1.0 };
-                self.set_place(&place, Value::Num(new))?;
-                Value::Num(if *prefix { new } else { old })
+                // `c[$1]++` is the hot shape: the subscript is usually a
+                // field, and the element usually already exists.  Building
+                // a Place would copy the key into an `Rc` on every record
+                // even when the lookup hits.
+                if let Expr::Index(name, subs) = target.as_ref() {
+                    self.fill_key(subs)?;
+                    let arr = self.array(name)?;
+                    let delta = if *incr { 1.0 } else { -1.0 };
+                    let old = arr.borrow_mut().add_number(&self.key_buf, delta);
+                    Value::Num(if *prefix { old + delta } else { old })
+                } else {
+                    let place = self.place(target)?;
+                    let old = self.get_place(&place)?.to_num();
+                    let new = if *incr { old + 1.0 } else { old - 1.0 };
+                    self.set_place(&place, Value::Num(new))?;
+                    Value::Num(if *prefix { new } else { old })
+                }
             }
             Expr::Call(b, args) => self.builtin(*b, args)?,
             Expr::UserCall(name, args) => self.call_user(name, args)?,
@@ -1381,10 +2015,16 @@ impl<'p> Interp<'p> {
                     Cell::Untyped(_) => Cell::Untyped(Some(Link::Local(frame, slot))),
                 });
             }
+            if name == "NF" {
+                return Ok(Cell::Scalar(Value::Num(self.get_nf()?)));
+            }
+            if let Some(v) = self.special_slot(name) {
+                return Ok(Cell::Scalar(v.clone()));
+            }
+            self.store_scalar();
             return Ok(match self.globals.get(name.as_str()) {
                 Some(Var::Array(a)) => Cell::Array(a.clone()),
                 Some(Var::Scalar(v)) => Cell::Scalar(v.clone()),
-                None if name == "NF" => Cell::Scalar(Value::Num(self.get_nf()?)),
                 None => Cell::Untyped(Some(Link::Global(name.clone()))),
             });
         }
@@ -1408,14 +2048,24 @@ impl<'p> Interp<'p> {
                 if let Some(t) = target {
                     place = Some(self.resolve_target(t)?);
                 }
-                match self.next_main_record()? {
-                    None => return Ok(Value::Num(0.0)),
-                    Some(r) => {
-                        self.bump("NR");
-                        self.bump("FNR");
-                        r
+                if place.is_none() {
+                    if !self.next_main_record()? {
+                        return Ok(Value::Num(0.0));
                     }
+                    self.bump("NR");
+                    self.bump("FNR");
+                    self.note_record();
+                    return Ok(Value::Num(1.0));
                 }
+                // Into a variable: the current $0 stays as it is.
+                let mut buf = Vec::new();
+                if !self.read_main(&mut buf)? {
+                    return Ok(Value::Num(0.0));
+                }
+                self.bump("NR");
+                self.bump("FNR");
+                self.set_place(&place.unwrap(), Value::strnum(&buf))?;
+                return Ok(Value::Num(1.0));
             }
             GetlineKind::File | GetlineKind::Cmd => {
                 let src = match source {
@@ -1449,7 +2099,7 @@ impl<'p> Interp<'p> {
             }
         };
         match place {
-            None => self.set_record(Rc::from(rec)),
+            None => self.set_record(&rec),
             Some(p) => self.set_place(&p, Value::strnum(&rec))?,
         }
         Ok(Value::Num(1.0))
@@ -1482,7 +2132,7 @@ impl<'p> Interp<'p> {
     }
 
     fn num_arg(&mut self, e: &'p Expr) -> R<f64> {
-        Ok(self.eval(e)?.to_num())
+        self.eval_num(e)
     }
 
     /// The length of `s` in characters, as a number.
@@ -1494,6 +2144,49 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// Replace a literal in `$0` without allocating, when that is safe.
+    ///
+    /// `Some(count)` means the replacement was done (including a count of
+    /// zero: the text did not change).  `None` means the caller should
+    /// use the general substitution: the pattern is not a fixed string,
+    /// it is a raw regex (see `is_raw`), or the replacement is not the
+    /// same number of plain bytes (`&` and backslashes are special).
+    fn replace_record_inplace(&mut self, re: &Regex, repl: &[u8], global: bool) -> Option<usize> {
+        // A raw regex (an invalid byte written as `\351` in UTF-8 mode)
+        // is compiled to the bytes of its escaped form.  Those bytes are
+        // not what the match looks for in the record; the general path
+        // transcodes the record first.  Searching for them here would
+        // miss the byte.
+        if re.is_raw() {
+            return None;
+        }
+        let lit = re.literal_bytes()?;
+        if lit.len() != repl.len() || repl.contains(&b'&') || repl.contains(&b'\\') {
+            return None;
+        }
+        // Copy the pattern out of `re` before borrowing the record.
+        // The record is our own buffer, not shared with a saved `$0`
+        // (that was copied out when the value was built), so it can
+        // always be overwritten.
+        let lit = lit.to_vec();
+        let n = replace_literal(&mut self.record, &lit, repl, global);
+        if n > 0 {
+            // The bytes changed, so a previous split is wrong, and `$0`
+            // is now a plain string (not a strnum), same as assigning
+            // the result of the general substitution.
+            self.fields.ready = false;
+            self.fields.owned = false;
+            self.record_is_string = true;
+            self.record_value = None;
+            // Assigning `$0` (what the general path does) splits the new
+            // text with the FS that is current now, not the one from when
+            // the record was read.  `{ FS=":"; gsub(/a/,"b"); print $1 }`
+            // on `a:x` is `b`.
+            self.record_fs = self.var_str("FS");
+        }
+        Some(n)
+    }
+
     /// Call a builtin function.  The parser has checked the argument
     /// counts; arguments are evaluated here, as each builtin needs them.
     fn builtin(&mut self, b: Builtin, args: &'p [Expr]) -> R<Value> {
@@ -1503,7 +2196,12 @@ impl<'p> Interp<'p> {
             Length => {
                 Self::arity(b, args, 0, 1)?;
                 match args.first() {
-                    None => num(self.length(&self.record.clone())),
+                    None => num(self.length(&self.record)),
+                    // `$0` is the record buffer; counting it does not
+                    // need a copy of the bytes.
+                    Some(Expr::Field(ix)) if matches!(ix.as_ref(), Expr::Num(n) if *n == 0.0) => {
+                        num(self.length(&self.record))
+                    }
                     Some(Expr::Var(name)) => match self.array_if_array(name) {
                         Some(Some(arr)) => num(arr.borrow().len() as f64),
                         Some(None) => num(0.0), // untyped: stays untyped
@@ -1585,11 +2283,20 @@ impl<'p> Interp<'p> {
                 match args.get(2) {
                     // The default target is $0.
                     None => {
-                        let text = self.record.clone();
-                        let (out, n) = substitute(&re, &repl, &text, global);
-                        if n > 0 {
-                            self.set_field(0, Value::Str(Rc::from(out)))?;
-                        }
+                        // `gsub(/a/, "A")` replaces one byte with one byte.
+                        // If nothing else holds the record, that can be
+                        // done in the buffer it already occupies.
+                        let n = match self.replace_record_inplace(&re, &repl, global) {
+                            Some(n) => n,
+                            None => {
+                                let text = self.record.clone();
+                                let (out, n) = substitute(&re, &repl, &text, global);
+                                if n > 0 {
+                                    self.set_field(0, Value::Str(Rc::from(out)))?;
+                                }
+                                n
+                            }
+                        };
                         num(n as f64)
                     }
                     // An lvalue is resolved once (`arr[i++]` steps i once)
@@ -1686,6 +2393,45 @@ impl<'p> Interp<'p> {
             }
         }
     }
+}
+
+/// Overwrite non-overlapping occurrences of `lit` with `repl` (same
+/// length) inside `buf`.  `global` false stops after the first.  Returns
+/// how many were replaced.
+fn replace_literal(buf: &mut [u8], lit: &[u8], repl: &[u8], global: bool) -> usize {
+    if lit.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    if lit.len() == 1 {
+        let from = lit[0];
+        let to = repl[0];
+        while i < buf.len() {
+            if buf[i] == from {
+                buf[i] = to;
+                count += 1;
+                if !global {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        return count;
+    }
+    while i + lit.len() <= buf.len() {
+        if &buf[i..i + lit.len()] == lit {
+            buf[i..i + lit.len()].copy_from_slice(repl);
+            count += 1;
+            i += lit.len();
+            if !global {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// Arithmetic with AWK's error rules: division by zero is fatal; `%` is

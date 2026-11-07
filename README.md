@@ -23,8 +23,24 @@ regex patterns, and its `printf` agrees with the C library on an
 18,000-case table (`tools/printf_table.py`). On `enhancements` it passes
 all 561 corpus cases that pyawk v1.1 runs here, both regex tables (C and
 UTF-8) line for line, and 0 AST mismatches with pyawk v1.1. See
-PLAN.md for progress and the current test numbers, and `tools/bench.py` for
-a rough speed comparison with other awks.
+PLAN.md for progress and the current test numbers.
+
+`tools/bench.py` times five programs on 500,000 generated lines (best of
+3). On the machine used for the performance work, seconds, hawk / mawk /
+gawk, `LC_ALL=C`:
+
+| program | hawk | mawk | gawk |
+|---|---:|---:|---:|
+| field sum | 0.07 | 0.05 | 0.07 |
+| regex filter | 0.06 | 0.05 | 0.06 |
+| gsub | 0.09 | 0.05 | 0.20 |
+| regex FS + arrays | 0.08 | 0.08 | 0.12 |
+| printf | 0.21 | 0.22 | 0.34 |
+
+UTF-8 mode (`--locale C.UTF-8`) is within a hundredth of those hawk
+numbers. At v1.1, before that work, the same runs were 0.26, 0.13, 0.25,
+0.29 and 0.47. DESIGN.md, "Performance", says what changed and what a
+compiler would still buy.
 
 ## Building
 
