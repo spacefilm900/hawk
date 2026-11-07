@@ -70,6 +70,7 @@ cargo test                     # unit tests only
 tools/test_tools.py            # unit tests of the Python harness
 tools/run_corpus.py [-v] [--diff] [CATEGORY | CATEGORY/NAME ...]
 tools/regex_check.py [--show N]
+tools/differential.py [--ref NAME=CMD ...] [--only stress|regex|golden]   # needs reference awks
 ```
 
 * `tests/corpus/golden/` is pyawk v1.1's golden corpus: 154 cases in 14
@@ -98,6 +99,28 @@ of 561 corpus cases (121 skipped) and agrees on all 15,655 regex lines.
 pyawk v1.1's, using the hidden `hawk --dump-ast` flag (regress.sh runs it
 when a pyawk checkout sits next to this repository, and says so when it
 skips it).
+
+`tools/differential.py` is the slow check, and it needs reference awks: mawk,
+onetrue-awk (`original-awk`), `gawk --posix` and BusyBox, skipping any that
+are missing.
+* **Gate:** 18 stress programs on large generated inputs must match the
+  majority of the references.
+* **Reports only:** the regex probe run live, and the golden corpus, compared
+  with the references that agree with each other.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` (canonical copy `ci/github-ci.yml`) runs on push
+to `enhancements`, on pull requests, on manual dispatch and weekly. It has
+two jobs:
+* `check`: `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, the
+  release build, the harness tests, `run_corpus.py` and `regex_check.py`.
+  These are the same steps as `tools/regress.sh`, apart from `ast_check.py`,
+  which needs the pyawk checkout.
+* `differential`: installs the reference awks with apt, then runs
+  `tools/differential.py`. It is separate and slower.
+
+The workflow uses no third-party crates and no secrets.
 
 ## Layout
 

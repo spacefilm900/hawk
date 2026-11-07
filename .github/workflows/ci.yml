@@ -1,0 +1,94 @@
+# CI for hawk. Local recipe: tools/regress.sh (the `check` job runs the same
+# steps one by one) and tools/differential.py (the `differential` job).
+# This file is the canonical copy of .github/workflows/ci.yml; keep the two
+# identical (pyawk uses the same layout: ci/github-ci.yml).
+#
+# hawk has no third-party crates, and this workflow adds none. It uses only
+# actions/checkout and the rustup/Python already on the runner. It needs no
+# secrets and does not depend on pyawk.
+name: CI
+
+"on":
+  push:
+    branches: [enhancements]
+  pull_request:
+    branches: [enhancements, main]
+  workflow_dispatch:
+  # Weekly: re-run the slow differential job against whatever reference
+  # awks the distribution currently ships.
+  schedule:
+    - cron: "41 5 * * 1"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  # Deny warnings in every rustc invocation as well as in clippy.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test, release build, corpus
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version; cargo --version; cargo fmt --version; cargo clippy --version
+          python3 --version
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
+      - name: Harness unit tests
+        run: python3 tools/test_tools.py
+      - name: Corpus (golden + imported onetrue/gawk suites)
+        # Committed .out files; no reference awk needed. Fails on a regression
+        # against tests/corpus/PASSING.
+        run: python3 tools/run_corpus.py
+      - name: Regex check (recorded three-awk majority)
+        run: python3 tools/regex_check.py
+
+  differential:
+    name: differential and stress (reference awks)
+    # A separate, slower job. On push/PR it runs after `check` passes. It also
+    # runs on manual dispatch and on the weekly schedule.
+    needs: [check]
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.check.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install reference awks (skip any that are unavailable)
+        run: |
+          sudo apt-get update -qq
+          for pkg in mawk gawk original-awk busybox; do
+            sudo apt-get install -y -qq "$pkg" || echo "::warning::could not install $pkg; it will be skipped"
+          done
+          for a in mawk gawk original-awk busybox; do
+            command -v "$a" >/dev/null && echo "$a: $(command -v "$a")" || echo "$a: not installed"
+          done
+          mawk -W version 2>&1 | head -1 || true
+          gawk --version | head -1 || true
+          original-awk --version 2>&1 | head -1 || true
+          busybox 2>&1 | head -1 || true
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Release build
+        run: cargo build --release
+      - name: Differential and stress check
+        # Gate: the stress programs must match the majority of the references.
+        # The regex and golden sections are reports, written to the job summary.
+        run: python3 tools/differential.py --scale 2
