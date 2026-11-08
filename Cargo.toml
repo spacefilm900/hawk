@@ -1,6 +1,6 @@
 [package]
 name = "hawk"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 authors = ["Keith Haviland"]
 description = "Haviland Awk: a POSIX AWK interpreter in Rust (a port of pyawk)"
