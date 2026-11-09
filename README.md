@@ -151,3 +151,14 @@ The workflow uses no third-party crates and no secrets.
 ## License
 
 MIT, copyright (c) 2026 Keith Haviland; see [LICENSE](LICENSE).
+
+The interpreter code is MIT. The imported test suites under
+`tests/corpus/` have their own licences:
+
+- `tests/corpus/gawk/` — GNU Awk (gawk) 5.4.1 tests, GPL v3 or later;
+  see [tests/corpus/gawk/NOTICE.md](tests/corpus/gawk/NOTICE.md) and
+  [tests/corpus/gawk/LICENSE-GPL-3.0.txt](tests/corpus/gawk/LICENSE-GPL-3.0.txt).
+- `tests/corpus/onetrue/` — onetrue awk tests, Lucent Technologies 1997
+  notice; see [tests/corpus/onetrue/NOTICE.md](tests/corpus/onetrue/NOTICE.md).
+
+Those files are test data only and are not part of the interpreter.
