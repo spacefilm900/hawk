@@ -15,18 +15,20 @@ the purpose of the project, how to verify it, and the rules for changing it.
   input that is not valid UTF-8 passes through unchanged. In a UTF-8 locale
   (`LC_ALL`, `LC_CTYPE` or `LANG` naming UTF-8) string functions, `printf`
   and regexes count characters instead, as in pyawk v1.1.
-* **Scope.** The first target is pyawk v1.0's feature set (tag `v1.0` of
-  pyawk). The v1.1 extras are being ported on the `enhancements` branch:
-  the POSIX parse-time errors, `nextfile`, `ENVIRON`, the full I/O
-  audit and UTF-8 locale mode are done. See [PLAN.md](PLAN.md).
+* **Scope.** POSIX AWK, including POSIX 2024 `nextfile`, with the same
+  feature set as pyawk: the POSIX parse-time errors, `ENVIRON`, the full
+  I/O and `getline` forms, and UTF-8 locale mode. Gawk-only extensions
+  are out of scope. [PLAN.md](PLAN.md) records how the port was staged.
 
-**Status:** the lexer, parser, interpreter and the POSIX regex engine are
-done; hawk passes all 504 corpus cases that pyawk v1.0 passes and all 570
-regex patterns, and its `printf` agrees with the C library on an
-18,000-case table (`tools/printf_table.py`). On `enhancements` it passes
-all 561 corpus cases that pyawk v1.1 runs here, both regex tables (C and
-UTF-8) line for line, and 0 AST mismatches with pyawk v1.1. See
-PLAN.md for progress and the current test numbers.
+**Status:** version 1.2.1 (tag `v1.2.1`), complete for its POSIX scope.
+`make check` passes every suite: 201 Rust unit and integration tests;
+the golden corpus (154 of 154); the imported onetrue suite (215 passed,
+9 skipped) and gawk suite (192 passed, 112 skipped); both recorded regex
+tables line for line (13,503 C-locale lines and 2,152 UTF-8 lines); and
+0 parse-tree mismatches with pyawk over 682 programs. Its `printf`
+agrees with the C library on an 18,000-case table
+(`tools/printf_table.py`). [HANDOVER.md](HANDOVER.md) lists the expected
+`make check` output.
 
 `tools/bench.py` times five programs on 500,000 generated lines (best of
 3). On the machine used for the performance work, seconds, hawk / mawk /
@@ -115,7 +117,7 @@ are missing.
 ### Continuous integration
 
 `.github/workflows/ci.yml` (canonical copy `ci/github-ci.yml`) runs on push
-to `enhancements`, on pull requests, on manual dispatch and weekly. It has
+to `enhancements` or `main`, on pull requests, on manual dispatch and weekly. It has
 two jobs:
 * `check`: `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, the
   release build, the harness tests, `run_corpus.py` and `regex_check.py`.
