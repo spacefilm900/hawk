@@ -601,12 +601,13 @@ Decisions:
 * **`%c` in C mode** is the low byte of the code (pyawk v1.1, gawk,
   mawk), replacing v1.0's "256 and up as UTF-8".
 * **`%c` of a numeric string or unset variable** stays as in v1.0
-  (POSIX: the number), which differs from pyawk (see above).
+  (POSIX: the number). pyawk v1.0 used the string; pyawk since 2026-11-03
+  (commit 8e43a30) uses the number too, so this is no longer a difference.
 * **String comparison** is by bytes in both modes. For valid UTF-8 that
-  is code-point order; pyawk compares code points with invalid bytes at
-  U+DC80..DCFF, so the two can order an invalid byte differently against
-  a non-ASCII character: `"\200" < "é"` is 1 in hawk, mawk and gawk
-  (also with `--posix`), 0 in pyawk. **Flagged decision.**
+  is code-point order. pyawk v1.1 first compared Python strings (invalid
+  bytes at U+DC80..DCFF), so `"\200" < "é"` was 0 there and 1 in hawk,
+  mawk and gawk. pyawk since 2026-11-03 (commit fcc39f5) also compares
+  by bytes, so the two now agree.
 * **Speed.** On the benchmark UTF-8 mode is within noise of C mode
   (the table in "Performance" below); on non-ASCII text `gsub(/./, ...)`
   and class matches cost the same as in C mode and `length` about 20%
@@ -743,3 +744,42 @@ Closing that means compiling the tree, which this round does not do.
   implementation of every expression, which has to stay in lockstep with
   the tree walk or replace it. That is the point at which this round
   stopped.
+
+## Decisions approved by the owner
+
+These choices were approved in discussion and were not yet written down in
+this file (neighbouring sections already record the rest, including `%#g`,
+the `%c` byte behaviour, the printf width cap, write errors, and the 4M
+UTF-8 regex state cap). Dates are the day the behaviour landed, or the
+day it was written into the notes.
+
+* **`FILENAME` when reading standard input** (2026-11-07).
+  If no file operand is processed (there are none, or only `var=value`
+  assignments), hawk reads standard input and sets `FILENAME` to `"-"`,
+  as POSIX.1-2024 requires: "awk shall set FILENAME to '-' and process
+  standard input as if it was given as a file operand". mawk, gawk and
+  pyawk do the same. `FILENAME` stays unset in `BEGIN` until input is
+  opened.
+
+* **Empty and missing fields, and Austin Group interpretation #1198**
+  (noted 2026-11, during the POSIX challenge work).
+  The Austin Group is the body that maintains the POSIX standard.
+  Interpretation #1198 (2019) records that POSIX is unclear whether an
+  empty or missing field has a string value. hawk follows the three
+  reference awks and pyawk: a field past `NF`, and an existing empty
+  field, is the empty string, not the uninitialized value, so `$5 == 0`
+  is a *string* comparison and false. Those cases are *observational*:
+  a difference is not treated as a POSIX failure.
+
+* **`[[=é=]]` matches only itself** (2026-11-02, with pyawk's UTF-8
+  choices). An equivalence class or collating symbol in a bracket
+  expression matches that character only, in both the C locale and
+  UTF-8 mode. It does not expand to glibc's class (`e`, `E`, `É`, ...).
+  The same rule is in pyawk's "Locales and UTF-8".
+
+* **`a+?` is `(a+)?`; POSIX 2024 shortest match is not implemented**
+  (recorded with the regex decisions). A `?` after a repeat is read as
+  "the repeat, made optional", as in mawk and onetrue-awk, not as POSIX
+  2024's leftmost-shortest match. gawk (without `--posix`) does implement
+  shortest match. This is unchanged on purpose.
+
