@@ -1,16 +1,21 @@
-# Handover
+# Maintainer guide (HANDOVER)
 
 ## Purpose
 
-This file exists so that another agent or developer can take over
-maintenance of hawk without relying on the original assistant (Grok Bot)
-or its chat history. It is the entry point: it says what to read, how to
-build and verify the tree, and the rules that must be followed.
+This guide lets any new maintainer, human or AI agent, take over hawk
+from the repository alone. It is the entry point: it says what to read,
+how to build and verify the tree, how releases and branches work, and
+the rules every change must follow. Nothing outside this repository is
+needed to carry on the work.
 
 Start here, then read [README.md](README.md) for usage and the test map,
 [PLAN.md](PLAN.md) for how the port was staged, and [DESIGN.md](DESIGN.md)
-for architecture and semantic decisions. Do not treat this chat, or any
-assistant's memory, as a source of truth once you have this file.
+for architecture and semantic decisions. If this guide and DESIGN.md
+disagree with anyone's recollection, the files in the repository win.
+
+hawk was developed by Keith Haviland (the owner) working with AI
+assistants: the code was written by Grok Bot and reviewed by CodeRabbit,
+with the decisions recorded in DESIGN.md.
 
 ## Project overview and scope
 
@@ -132,19 +137,23 @@ regression.
 
 ## Release and git workflow
 
-* **`main` is frozen at v1.0** (commit `f6585db`, tag `v1.0`). Do not
-  merge into it, push to it, or change it unless the owner has explicitly
-  asked you to.
-* **Do all work on `enhancements`.** That is the current development
-  branch (v1.2.1 and later fixes).
-* **The open pull request into `main` is a review vehicle only.** A
-  pull request (PR) is a proposed change put up for review. PR #2 exists
-  so that CodeRabbit can comment on the work. It must never be merged.
+* **`main` is the published branch.** On 10 November 2026 it was
+  fast-forwarded to `enhancements` (no history rewritten), so it holds
+  v1.2.1 and the later fixes. Releases are marked by tags (`v1.0` to
+  `v1.2.1`). Move `main` only with the owner's approval, and only as a
+  fast-forward from `enhancements`.
+* **Do all work on `enhancements`**, or on a branch made from it. That
+  is the development branch.
+* **Review history.** Pull requests (PRs, proposed changes put up for
+  review) #1 and #2 were review vehicles so that CodeRabbit could comment
+  on the work. They are closed, unmerged, and kept for the record. The
+  branches they used are kept as the tags `archive/review-base` and
+  `archive/cursor-faster-interpreter-993d`; never merge those tags.
 * **Tags and GitHub releases only with the owner's approval.** A tag is
   a named label for one commit, used to mark a release. Do not create
   one yourself.
 * **CI** (GitHub Actions, `.github/workflows/ci.yml`) runs on push to
-  `enhancements`, on pull requests into `enhancements` or `main`, on
+  `enhancements` or `main`, on pull requests into `enhancements` or `main`, on
   manual dispatch, and weekly. The `check` job is fmt, clippy with
   `-D warnings`, `cargo test`, the release build, the harness tests,
   `run_corpus.py` and `regex_check.py` (the same steps as
@@ -191,8 +200,7 @@ so re-importing does not strip the notices.
 
 ## Related resources
 
-These live beside this repository on the development machine, and as
-sibling GitHub repositories under `spacefilm900`. They are not part of
+These are sibling GitHub repositories under `spacefilm900`. They are not part of
 the hawk tree.
 
 * **[spacefilm900/pyawk](https://github.com/spacefilm900/pyawk)** — the
@@ -208,25 +216,23 @@ the hawk tree.
   — a large-input check that runs a portable program over the complete
   works of Shakespeare. Output must match the committed expected text
   byte for byte.
-* **Reference awks** used for votes, imports and the differential job,
-  on the development machine under `/workspace/refs` (and `mawk` from
-  the system):
+* **Reference awks** used for votes, imports and the differential job.
+  hawk does not hard-code their locations; put them on `PATH`:
 
-  | reference | usual name on PATH | path on this machine |
-  |---|---|---|
-  | mawk | `mawk` | `/usr/bin/mawk` |
-  | onetrue awk | `original-awk`, `onetrue-awk` or `bwk-awk` | `/workspace/refs/onetrue-awk/a.out` |
-  | gawk (the differential job runs `gawk --posix`) | `gawk` | `/workspace/refs/local/bin/gawk` (GNU Awk 5.4.1) |
-  | BusyBox (comparison only, not a tie-break voter) | `busybox awk` | `/workspace/refs/busybox/busybox` |
+  | reference | usual name on PATH |
+  |---|---|
+  | mawk | `mawk` |
+  | onetrue awk (the "one true awk") | `original-awk`, `onetrue-awk` or `bwk-awk` |
+  | gawk 5.4.1 (the differential job runs `gawk --posix`) | `gawk` |
+  | BusyBox (comparison only, not a tie-break voter) | `busybox awk` |
 
   `tools/differential.py` finds these on `PATH` and skips any that are
   missing; `--ref NAME=CMD` overrides a name. `tools/gen_unicode_tables.py`
-  uses `$HAWK_REF_GAWK`, else `/workspace/refs/local/bin/gawk` if that
-  file exists, else `gawk` on `PATH`.
+  uses `--gawk`, else `$HAWK_REF_GAWK`, else `gawk` on `PATH`.
 
 ## Known open items
 
-* **hawk PR #2, low-priority CodeRabbit note (scalar cache and `ARGC`).**
+* **Low-priority CodeRabbit note from PR #2 (scalar cache and `ARGC`).**
   On 7 November 2026 CodeRabbit reported that `var_num` and `var_str` in
   `src/interp.rs` read the `globals` map without first checking the
   one-name scalar cache. `store_scalar` writes a cached value back to
@@ -241,9 +247,9 @@ the hawk tree.
   for array keys (a possible collision construction). That is described
   in the PR's architecture review and in DESIGN.md, "Values". It is not
   a demonstrated correctness bug.
-* Reviews on PR #2 are paused: the last reviewed commit was `d24f8d1`;
-  the branch has moved on (licence and later commits). The PR must not
-  be merged.
+* CodeRabbit's last review on PR #2 covered commit `d24f8d1`; the
+  later commits (licence notices, CI, this guide and the path clean-up)
+  were not reviewed by it.
 * `PLAN.md` ends at the v1.1 port. The branch has since reached v1.2.1
   (performance work, CI, `FILENAME`, licence notices). Treat DESIGN.md
   and this file as more current than the later pages of PLAN.md.
