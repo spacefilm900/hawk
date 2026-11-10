@@ -10,7 +10,7 @@ name: CI
 
 "on":
   push:
-    branches: [enhancements]
+    branches: [enhancements, main]
   pull_request:
     branches: [enhancements, main]
   workflow_dispatch:
