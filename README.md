@@ -4,6 +4,9 @@ hawk is a POSIX AWK interpreter written in Rust. It is a port of
 [pyawk](https://github.com/spacefilm900/pyawk), the Python interpreter that
 came first, and it uses the same test corpus and the same semantic decisions.
 
+A new maintainer should start with [HANDOVER.md](HANDOVER.md): it explains
+the purpose of the project, how to verify it, and the rules for changing it.
+
 * **Zero dependencies.** It uses only Rust's standard library: `[dependencies]`
   and `[dev-dependencies]` in `Cargo.toml` are empty, and unit tests use
   Rust's built-in test framework. The test runners in `tools/` are small
@@ -65,6 +68,7 @@ syntax and runtime errors.
 ## Tests
 
 ```sh
+make check                     # every suite, then a one-line-per-suite summary (see HANDOVER.md)
 tools/regress.sh               # the full regression: run it after every change
 cargo test                     # unit tests only
 tools/test_tools.py            # unit tests of the Python harness
