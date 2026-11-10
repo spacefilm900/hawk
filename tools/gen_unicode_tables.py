@@ -17,8 +17,7 @@ result is a Rust module of sorted range tables.
 --pyawk DIR also checks the tables are the same as pyawk v1.1's
 (DIR/pyawk/unicode_tables.py), which came from GNU Awk 5.4.1.
 
-The gawk used is $HAWK_REF_GAWK, else /workspace/refs/local/bin/gawk if
-it exists, else "gawk" on PATH.
+The gawk used is --gawk, else $HAWK_REF_GAWK, else "gawk" on PATH.
 """
 
 from __future__ import annotations
@@ -169,8 +168,7 @@ def same_as_pyawk(members, upper, lower, pyawk_dir):
 def default_gawk():
     if os.environ.get("HAWK_REF_GAWK"):
         return os.environ["HAWK_REF_GAWK"]
-    local = Path("/workspace/refs/local/bin/gawk")
-    return str(local) if local.exists() else "gawk"
+    return "gawk"
 
 
 def main(argv=None):
