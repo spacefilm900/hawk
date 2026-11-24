@@ -20,7 +20,7 @@ the purpose of the project, how to verify it, and the rules for changing it.
 * **Scope.** POSIX AWK, including POSIX 2024 `nextfile`, with the same
   feature set as pyawk: the POSIX parse-time errors, `ENVIRON`, the full
   I/O and `getline` forms, and UTF-8 locale mode. Gawk-only extensions
-  are out of scope. [PLAN.md](PLAN.md) records how the port was staged.
+  are out of scope. [PLAN.md](PLAN.md) records how the port was staged, up to v1.1.
 
 ## Using it
 
@@ -43,6 +43,9 @@ printf '{ total += $1 } END { print total }\n' > sum.awk
 printf '3\n4\n' | target/release/hawk -f sum.awk            # prints: 7
 ```
 
+The exit status is the value of `exit expr` (0 by default). It is 2 for
+syntax and runtime errors.
+
 **Deliberate choices.** hawk makes the same choices as pyawk: POSIX first,
 then the majority of onetrue-awk, `gawk --posix` and mawk. They are written
 down in [DESIGN.md](DESIGN.md) ("Where hawk deliberately differs from pyawk
@@ -54,18 +57,13 @@ and the `-e` option, and the old `func` spelling (write `function`).
 Nothing is deferred at present.
 
 **Status:** version 1.2.1 (tag `v1.2.1`), complete for its POSIX scope.
-`make check` passes every suite: 201 Rust unit and integration tests;
-the golden corpus (154 of 154); the imported onetrue suite (215 passed,
-9 skipped) and gawk suite (192 passed, 112 skipped); both recorded regex
-tables line for line (13,503 C-locale lines and 2,152 UTF-8 lines); and
-0 parse-tree mismatches with pyawk over 682 programs. Its `printf`
-agrees with the C library on an 18,000-case table
-(`tools/printf_table.py`). [HANDOVER.md](HANDOVER.md) lists the expected
-`make check` output.
+`make check` passes every suite. [HANDOVER.md](HANDOVER.md) lists the exact
+figures.
 
-`tools/bench.py` times five programs on 500,000 generated lines (best of
-3). On the machine used for the performance work, seconds, hawk / mawk /
-gawk, `LC_ALL=C`:
+Times from `tools/bench.py` (500,000 lines, best of 3, `LC_ALL=C`, seconds)
+on the Linux build box used for development, with mawk and gawk on the same
+box. Times will differ on other machines; the comparison between columns is
+the point.
 
 | program | hawk | mawk | gawk |
 |---|---:|---:|---:|
@@ -76,31 +74,30 @@ gawk, `LC_ALL=C`:
 | printf | 0.21 | 0.22 | 0.34 |
 
 UTF-8 mode (`--locale C.UTF-8`) is within a hundredth of those hawk
-numbers (hawk v1.2). At v1.1, before that work, the same runs were 0.26, 0.13, 0.25,
-0.29 and 0.47. DESIGN.md, "Performance", says what changed and what a
-compiler would still buy.
+numbers. DESIGN.md, "Performance", has the earlier figures, says what
+changed and what a compiler would still buy.
 
 ## Building
 
-```sh
-cargo build --release          # produces target/release/hawk
-target/release/hawk --version
-```
-
-You need a stable Rust toolchain. With rustup, `rust-toolchain.toml` picks
-stable and adds `rustfmt` and `clippy`.
-
-## Usage
-
-```sh
-hawk 'program' [file ...]
-hawk -F: -v limit=10 -f prog.awk data.txt
-```
-
-The exit status is the value of `exit expr` (0 by default). It is 2 for
-syntax and runtime errors.
+You need Rust 1.88 or newer. With rustup, `rust-toolchain.toml` picks the
+current stable and adds `rustfmt` and `clippy`; some Linux distributions
+package an older Rust that cannot build hawk.
 
 ## Tests
+
+Current results (`make check`, 24 Nov 2026):
+
+| suite | result |
+|---|---|
+| Rust unit and integration tests | 201 passed |
+| golden corpus | 154 of 154 |
+| imported onetrue suite | 215 passed, 9 skipped |
+| imported gawk suite | 192 passed, 112 skipped |
+| regex tables | every line agrees (13,503 C-locale lines, 2,152 UTF-8 lines) |
+| parse trees vs pyawk | 682 programs, 0 mismatches |
+
+`printf` also agrees with the C library on a table of about 18,000 cases
+(`tools/printf_table.py`).
 
 ```sh
 make check                     # every suite, then a one-line-per-suite summary (see HANDOVER.md)
@@ -169,6 +166,7 @@ The workflow uses no third-party crates and no secrets.
 | `src/lib.rs` | the library root; declares the modules |
 | `src/cli.rs` | command-line options |
 | `src/error.rs` | the error type: syntax errors with a source line, runtime errors |
+| `src/charset.rs` | UTF-8 locale handling |
 | `src/lexer.rs` | program text to tokens; string escapes |
 | `src/ast.rs` | the syntax tree, and its canonical text dump |
 | `src/parser.rs` | tokens to syntax tree (recursive descent), parse-time checks |
@@ -181,13 +179,19 @@ The workflow uses no third-party crates and no secrets.
 | `src/rand.rs` | `rand`/`srand`, identical to pyawk's |
 | `src/regex/` | the regex engine: ERE parser, NFA, lazy DFA, leftmost-longest search |
 | `src/subst.rs` | sub/gsub replacement and regex splitting |
+| `src/unicode_tables.rs` | generated Unicode class tables |
 | `tests/run.rs` | end-to-end tests of the `hawk` binary |
+| `tests/io.rs`, `tests/utf8.rs` | end-to-end I/O and UTF-8 tests |
+| `tests/data/` | test data: the printf table |
 | `DESIGN.md` | architecture and Rust notes |
-| `PLAN.md` | phased plan and progress |
+| `HANDOVER.md` | guide for a new maintainer |
+| `PLAN.md` | the phased plan for the port, up to v1.1 (later work is in DESIGN.md and HANDOVER.md) |
 | `docs/pyawk-v1.0-DESIGN.md` | pyawk's design notes at v1.0: the semantic decisions hawk follows |
+| `docs/pyawk-v1.1-DESIGN.md` | pyawk's design notes at v1.1 |
 | `tools/` | test runners (Python, test tooling only) |
+| `tools/check.sh` | what `make check` runs |
 
-## License
+## Licence
 
 MIT, copyright (c) 2026 Keith Haviland; see [LICENSE](LICENSE).
 
