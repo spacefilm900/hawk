@@ -1,5 +1,8 @@
 # hawk: Haviland Awk
 
+> [!WARNING]
+> hawk is the result of an experiment in agentic software engineering. It is not intended to replace established, supported awk interpreters, and it is provided strictly "as is" under the MIT licence.
+
 hawk is a POSIX AWK interpreter written in Rust. It is a port of
 [pyawk](https://github.com/spacefilm900/pyawk), the Python interpreter that
 came first, and it uses the same test corpus and the same semantic decisions.
